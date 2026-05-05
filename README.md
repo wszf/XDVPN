@@ -50,16 +50,18 @@ openconnect 崩溃 → kernel 关 fd → utun 销毁 → `/1` 路由自动消失
 **sudoers**（2 条，仅白名单固定路径）：
 
 ```
-<user> ALL=(root) NOPASSWD: /opt/homebrew/bin/openconnect
-<user> ALL=(root) NOPASSWD: /usr/local/libexec/xdvpn-cleanup
+<user> ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/com.kafeifei.xdvpn/xdvpn-openconnect
+<user> ALL=(root) NOPASSWD: /Library/PrivilegedHelperTools/com.kafeifei.xdvpn/xdvpn-cleanup
 ```
 
-**Helper 脚本**（root:wheel 0755，用户不可写）：
+**Helper 脚本**（位于 `/Library/PrivilegedHelperTools/com.kafeifei.xdvpn/`，目录和文件均为 root:wheel、用户不可写）：
 
 | 文件 | 作用 |
 |------|------|
+| `xdvpn-openconnect` | 受控 openconnect wrapper，固定参数与 route script，只接受协议/用户/服务器 |
 | `xdvpn-route-script` | openconnect `--script` 调用，做 def1 路由 + DNS + 写 session |
 | `xdvpn-cleanup` | 停 openconnect + 按 session 记录逐项清理，幂等 |
+| `xdvpn-dns-proxy` | 域名分流时代理指定后缀 DNS，并只清理带 XDVPN 标记的 resolver 文件 |
 
 **凭据**：密码存 Keychain（`kSecAttrAccessibleWhenUnlocked`），其他字段 UserDefaults。
 

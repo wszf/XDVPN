@@ -9,11 +9,12 @@ signal(SIGINT) { _ in terminated = 1 }
 
 // MARK: - Argument parsing
 
-func parseArgs() -> (vpnDNS: String, utun: String, domainsPath: String) {
+func parseArgs() -> (vpnDNS: String, utun: String, domainsPath: String, readyFile: String?) {
     let args = CommandLine.arguments
     var vpnDNS: String?
     var utun: String?
     var domainsPath: String?
+    var readyFile: String?
     var i = 1
     while i < args.count {
         switch args[i] {
@@ -23,15 +24,17 @@ func parseArgs() -> (vpnDNS: String, utun: String, domainsPath: String) {
             utun = args[i + 1]; i += 2
         case "--domains" where i + 1 < args.count:
             domainsPath = args[i + 1]; i += 2
+        case "--ready-file" where i + 1 < args.count:
+            readyFile = args[i + 1]; i += 2
         default:
             fputs("Unknown argument: \(args[i])\n", stderr); exit(1)
         }
     }
     guard let dns = vpnDNS, let tun = utun, let path = domainsPath else {
-        fputs("Usage: xdvpn-dns-proxy --vpn-dns <ip> --utun <dev> --domains <path>\n", stderr)
+        fputs("Usage: xdvpn-dns-proxy --vpn-dns <ip> --utun <dev> --domains <path> [--ready-file <path>]\n", stderr)
         exit(1)
     }
-    return (dns, tun, path)
+    return (dns, tun, path, readyFile)
 }
 
 // MARK: - Domain loading
@@ -57,14 +60,26 @@ func createResolverFiles(for suffixes: [String]) {
     }
     for suffix in suffixes {
         let path = "\(dir)/\(suffix)"
-        try? "nameserver 127.0.0.1\n".write(toFile: path, atomically: true, encoding: .utf8)
+        if fm.fileExists(atPath: path) {
+            let existing = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+            guard existing.hasPrefix("# XDVPN resolver\n") else {
+                fputs("Resolver file already exists and is not managed by XDVPN: \(path)\n", stderr)
+                exit(1)
+            }
+        }
+        let content = "# XDVPN resolver\nnameserver 127.0.0.1\n"
+        try? content.write(toFile: path, atomically: true, encoding: .utf8)
     }
 }
 
 func deleteResolverFiles(for suffixes: [String]) {
     let fm = FileManager.default
     for suffix in suffixes {
-        try? fm.removeItem(atPath: "/etc/resolver/\(suffix)")
+        let path = "/etc/resolver/\(suffix)"
+        let existing = (try? String(contentsOfFile: path, encoding: .utf8)) ?? ""
+        if existing.hasPrefix("# XDVPN resolver\n") {
+            try? fm.removeItem(atPath: path)
+        }
     }
 }
 
@@ -239,6 +254,9 @@ createResolverFiles(for: suffixes)
 
 let listenerSock = createBoundListener()
 let (upstreamSock, upstreamAddr) = createUpstreamSocket(vpnDNS: config.vpnDNS)
+if let readyFile = config.readyFile {
+    try? "\(getpid())\n".write(toFile: readyFile, atomically: true, encoding: .utf8)
+}
 
 var routeCache = Set<String>()
 var recvBuf = [UInt8](repeating: 0, count: 65535)
@@ -266,6 +284,9 @@ func sendKeepalive() {
 
 func cleanup() {
     deleteResolverFiles(for: suffixes)
+    if let readyFile = config.readyFile {
+        try? FileManager.default.removeItem(atPath: readyFile)
+    }
     close(listenerSock)
     close(upstreamSock)
     close(keepaliveSock)

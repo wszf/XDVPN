@@ -51,25 +51,19 @@ enum OpenConnectRunner {
         password: String
     ) throws {
         guard protocols.contains(protocolName) else { throw VPNError.invalidProtocol }
-        guard let ocPath = openconnectPath else { throw VPNError.openconnectNotFound }
-
         // 清掉可能残留的旧 pid 文件（openconnect 会创建新的，但防御一下）
         try? FileManager.default.removeItem(atPath: pidPath)
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
         // 所有参数由 arguments 传入，不经 shell，密码不会被日志捕获。
-        // 不用 --setuid：openconnect 必须保持 root 才能让我们的 script 动路由。
+        // sudoers 只放行 xdvpn-openconnect wrapper，wrapper 固定 openconnect 参数。
         proc.arguments = [
-            "-n",                                            // 非交互；sudoers 没配会立刻失败
-            ocPath,
-            "--background",
-            "--pid-file=" + pidPath,
-            "--script=" + SudoersInstaller.routeScriptPath,  // 关键：替换 vpnc-script
-            "--protocol=" + protocolName,
-            "--passwd-on-stdin",
-            "--user=" + user,
-            "--non-inter",
+            "-n", // 非交互；sudoers 没配会立刻失败
+            SudoersInstaller.openconnectWrapperPath,
+            "--protocol", protocolName,
+            "--user", user,
+            "--server",
             server,
         ]
 

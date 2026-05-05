@@ -287,7 +287,13 @@ final class VPNController: ObservableObject {
         isBusy = true
         Task.detached { [weak self] in
             let errMsg: String? = {
-                do { try SudoersInstaller.install(); return nil }
+                do {
+                    try SudoersInstaller.install()
+                    // 装完之后同步跑一次 cleanup，顺手把 v0.2 残余（如果有）也清了。
+                    // 完成后才允许自动连接，避免后台 cleanup 删掉新连接的 split/domain conf。
+                    try? OpenConnectRunner.cleanup()
+                    return nil
+                }
                 catch { return error.localizedDescription }
             }()
             await MainActor.run { [weak self] in
@@ -296,10 +302,6 @@ final class VPNController: ObservableObject {
                 self.sudoConfigured = SudoersInstaller.isInstalled
                 if let errMsg { self.statusText = errMsg }
                 else if !self.isConnected { self.statusText = "未连接" }
-                // 装完之后立刻跑一次 cleanup，顺手把 v0.2 残余（如果有）也清了
-                if self.sudoConfigured {
-                    self.runCleanupDetached(reason: "安装后首次清理")
-                }
                 // 配置成功 + 凭据齐全 → 自动连接
                 if thenConnect, self.canConnect {
                     self.connect()
