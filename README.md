@@ -15,21 +15,30 @@
 
 ## 安装
 
-下载 [Release](https://github.com/kafeifei/XDVPN/releases/latest)，或自己构建：
-
-```bash
-./build.sh && open build/XDVPN.app
-```
+下载 [Release](https://github.com/kafeifei/XDVPN/releases/latest) 里的 `XDVPN-v*.zip`，解压后把 `XDVPN.app` 拖进 `/Applications/`。
 
 Release 包已内置 OpenConnect；用户机器不需要预装 Homebrew 或 openconnect。
 
-> 未经 Apple 公证，首次打开需：系统设置 → 隐私与安全性 → "仍要打开"。
-> 自己 `./build.sh` 的不受此限制。
+### 首次打开
+
+XDVPN 目前未做 Apple 公证，首次打开可能会被 macOS Gatekeeper 拦截。推荐流程：
+
+1. 双击 `/Applications/XDVPN.app`，看到系统拦截提示后点“完成”或关闭弹窗。
+2. 打开“系统设置 → 隐私与安全性”。
+3. 在页面底部找到 XDVPN 的拦截提示，点击“仍要打开”。
+4. 再次确认打开。
+
+如果系统设置里没有出现“仍要打开”，也可以在终端执行：
+
+```bash
+xattr -dr com.apple.quarantine /Applications/XDVPN.app
+open /Applications/XDVPN.app
+```
 
 ## 使用
 
 1. 菜单栏出现锁盾图标，点开弹窗
-2. 底部点"一键配置"免密 sudo（仅首次）
+2. 底部点"一键配置"安装系统组件（仅首次）
 3. 填服务器、用户名、密码，点连接
 
 ## 路由安全
