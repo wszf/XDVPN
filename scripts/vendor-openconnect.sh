@@ -42,15 +42,12 @@ if [[ -z "$source_bin" ]]; then
 fi
 source_bin="$(realpath "$source_bin")"
 
-version_line="$(LC_ALL=C "$source_bin" --version 2>&1 | head -n 1)"
-case "$version_line" in
-  "OpenConnect version v${allowed_minor}"|"OpenConnect version v${allowed_minor}."*|"OpenConnect version v${allowed_minor}-"*) ;;
-  *)
+version_line="$("$source_bin" --version 2>&1 | head -n 1)"
+if ! printf '%s\n' "$version_line" | grep -qE "v${allowed_minor}(\$|[.-])"; then
     echo "error: unsupported openconnect version: $version_line" >&2
     echo "       allowed minor is $allowed_minor.x; update Vendor/openconnect.lock after compatibility testing" >&2
     exit 1
-    ;;
-esac
+fi
 
 VENDOR_DIR="$APP/Contents/Resources/openconnect"
 BIN_DIR="$VENDOR_DIR/bin"

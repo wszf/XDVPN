@@ -3,12 +3,27 @@ import SwiftUI
 
 struct XDVPNApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-    @StateObject private var controller = VPNController()
+    @StateObject private var controller: VPNController
+    @StateObject private var updater = UpdateChecker()
+    #if DEBUG
+    private let debugServer: DebugServer
+    #endif
+
+    init() {
+        let c = VPNController()
+        _controller = StateObject(wrappedValue: c)
+        #if DEBUG
+        debugServer = DebugServer(vpn: c)
+        debugServer.start()
+        #endif
+    }
 
     var body: some Scene {
         MenuBarExtra {
             ContentView()
                 .environmentObject(controller)
+                .environmentObject(updater)
+                .onAppear { updater.check() }
         } label: {
             // 注意：在 MenuBarExtra 的 label 槽里塞 SwiftUI 滤镜链（.saturation /
             // .frame / .aspectRatio 这类）菜单栏渲染出来常常是 0×0 空白。

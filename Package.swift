@@ -7,7 +7,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "XDVPN",
-            path: "Sources/XDVPN"
+            path: "Sources/XDVPN",
+            swiftSettings: [
+                .define("DEBUG", .when(configuration: .debug)),
+            ]
         ),
         .executableTarget(
             name: "xdvpn-dns-proxy",

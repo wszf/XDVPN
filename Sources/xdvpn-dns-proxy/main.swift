@@ -250,10 +250,13 @@ guard !suffixes.isEmpty else {
     exit(1)
 }
 
-createResolverFiles(for: suffixes)
-
 let listenerSock = createBoundListener()
 let (upstreamSock, upstreamAddr) = createUpstreamSocket(vpnDNS: config.vpnDNS)
+
+// Resolver files must be created AFTER binding port 53, otherwise macOS
+// routes queries to 127.0.0.1:53 before anything is listening — the
+// fallback to system DNS caches a negative response that persists.
+createResolverFiles(for: suffixes)
 if let readyFile = config.readyFile {
     try? "\(getpid())\n".write(toFile: readyFile, atomically: true, encoding: .utf8)
 }

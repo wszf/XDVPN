@@ -315,6 +315,8 @@ enum SudoersInstaller {
                     append_state "DNS_PROXY_PID=$DNS_PROXY_PID"
                     append_state "DNS_PROXY_READY=$READY"
                     append_resolver_state_from_domain_conf "$DOMAIN_CONF"
+                    dscacheutil -flushcache
+                    killall -HUP mDNSResponder 2>/dev/null || true
                 else
                     kill -TERM "$DNS_PROXY_PID" 2>/dev/null || true
                     remove_resolvers_from_domain_conf "$DOMAIN_CONF"
@@ -362,6 +364,8 @@ enum SudoersInstaller {
                   DNS_PROXY_READY) rm -f "$val" ;;
                 esac
             done < "$SESSION"
+            dscacheutil -flushcache
+            killall -HUP mDNSResponder 2>/dev/null || true
 
             # DNS
             KEY=""
@@ -467,6 +471,8 @@ enum SudoersInstaller {
               DNS_PROXY_READY) rm -f "$val" ;;
             esac
         done < "$SESSION"
+        dscacheutil -flushcache
+        killall -HUP mDNSResponder 2>/dev/null || true
     fi
     # 兜底：杀掉任何残留的 dns-proxy（升级遗留、session 丢失等）
     pkill -x xdvpn-dns-proxy 2>/dev/null || true
