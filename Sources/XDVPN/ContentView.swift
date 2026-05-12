@@ -84,10 +84,11 @@ struct ContentView: View {
             // 按钮行
             HStack(spacing: 8) {
                 if vpn.isConnected {
-                    Button("断开") { vpn.disconnect() }
-                        .tint(.red)
-                        .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
+                    Button { vpn.disconnect() } label: {
+                        Label("断开", systemImage: "power")
+                            .labelStyle(.titleAndIcon)
+                    }
+                    .buttonStyle(SubtleDisconnectButtonStyle())
                         .disabled(vpn.isBusy)
 
                     TimelineView(.periodic(from: .now, by: 1)) { _ in
@@ -166,6 +167,42 @@ struct ContentView: View {
         if vpn.isConnected { return .green }
         if vpn.isBusy { return .orange }
         return .secondary
+    }
+}
+
+private struct SubtleDisconnectButtonStyle: ButtonStyle {
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .font(.system(.caption, weight: .medium))
+            .symbolVariant(.circle)
+            .foregroundStyle(foregroundColor(pressed: configuration.isPressed))
+            .padding(.horizontal, 9)
+            .frame(height: 24)
+            .background {
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .fill(backgroundColor(pressed: configuration.isPressed))
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    .stroke(borderColor, lineWidth: 1)
+            }
+            .opacity(isEnabled ? 1 : 0.55)
+    }
+
+    private func backgroundColor(pressed: Bool) -> Color {
+        if !isEnabled { return Color.secondary.opacity(0.05) }
+        return Color.secondary.opacity(pressed ? 0.12 : 0.06)
+    }
+
+    private func foregroundColor(pressed: Bool) -> Color {
+        if !isEnabled { return Color.secondary }
+        return pressed ? Color.red.opacity(0.9) : Color.primary.opacity(0.78)
+    }
+
+    private var borderColor: Color {
+        isEnabled ? Color.secondary.opacity(0.22) : Color.secondary.opacity(0.14)
     }
 }
 
@@ -271,4 +308,3 @@ extension NSImage {
         return img
     }()
 }
-
