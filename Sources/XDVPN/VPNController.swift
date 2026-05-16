@@ -131,6 +131,11 @@ final class VPNController: ObservableObject {
 
     private var lastTrafficSample: (inBytes: UInt64, outBytes: UInt64, at: Date)?
     private var pollTimer: Timer?
+    /// 自动重连：连接突然死掉时跑的 backoff 重试。
+    /// 每次成功连上后清零，每次失败递增；超过 maxAttempts 就放弃
+    private var autoReconnectAttempt: Int = 0
+    private var autoReconnectTimer: Timer?
+    private let autoReconnectMaxAttempts = 5
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
     /// 睡前是否连着 → 醒来自动重连
@@ -367,6 +372,8 @@ final class VPNController: ObservableObject {
                     }
                     self.savePrefs()
                     BiometricGate.markActivity()
+                    // 成功连上 → 重置自动重连计数（之后再断只算"新一轮"）
+                    self.autoReconnectAttempt = 0
                     self.isConnected = true
                     self.connectedAt = Date()
                     if proxyMode {
@@ -392,6 +399,8 @@ final class VPNController: ObservableObject {
 
     func disconnect() {
         guard isConnected || isBusy == false else { return }
+        // 用户主动断开 → 取消任何待执行的自动重连
+        cancelAutoReconnect()
         isBusy = true
         statusText = "正在断开…"
 
@@ -481,27 +490,73 @@ final class VPNController: ObservableObject {
             if tunnelInterface == nil { parseSessionFile() }
             updateTrafficStats()
         }
-        // 声明"连着"但进程没了 = 意外死亡 → 自动清理
+        // 声明"连着"但进程没了 = 意外死亡 → 自动清理 + 重连
         if isConnected, !running, !isBusy {
             isBusy = true
             statusText = "连接已丢失，正在清理…"
             if useProxyMode {
-                Task.detached {
+                Task.detached { [weak self] in
                     OpenConnectRunner.disconnectProxyMode()
                     await MainActor.run { [weak self] in
-                        self?.isConnected = false
-                        self?.isBusy = false
-                        self?.statusText = "未连接"
+                        guard let self else { return }
+                        self.isConnected = false
+                        self.isBusy = false
+                        self.scheduleAutoReconnect()
                     }
                 }
             } else {
                 runCleanupDetached(reason: "意外断开自动清理") { [weak self] in
-                    self?.isConnected = false
-                    self?.isBusy = false
-                    self?.statusText = "未连接"
+                    guard let self else { return }
+                    self.isConnected = false
+                    self.isBusy = false
+                    self.scheduleAutoReconnect()
                 }
             }
         }
+    }
+
+    // MARK: - 自动重连（意外掉线场景）
+    //
+    // 触发：pollTick 检测到 isConnected=true 但 openconnect/ocproxy 进程没了。
+    // 策略：指数退避 1/2/4/8/16s，5 次都不行就放弃，状态栏给提示。
+    // 重置：每次手动 disconnect、休眠 willSleep、和成功连上后都清零计数。
+
+    private func scheduleAutoReconnect() {
+        autoReconnectTimer?.invalidate()
+        autoReconnectTimer = nil
+
+        // 没凭据 → 不可能重连，直接放弃
+        guard !server.isEmpty, !user.isEmpty, !password.isEmpty else {
+            statusText = "未连接（凭据不全，请手动连接）"
+            return
+        }
+
+        autoReconnectAttempt += 1
+        if autoReconnectAttempt > autoReconnectMaxAttempts {
+            statusText = "自动重连失败 \(autoReconnectMaxAttempts) 次，请手动重连"
+            autoReconnectAttempt = 0
+            return
+        }
+
+        // 1, 2, 4, 8, 16 秒
+        let delay = pow(2.0, Double(autoReconnectAttempt - 1))
+        statusText = "连接已丢失，\(Int(delay))s 后自动重连（第 \(autoReconnectAttempt)/\(autoReconnectMaxAttempts) 次）"
+
+        autoReconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.autoReconnectTimer = nil
+                if !self.isConnected, self.canConnect {
+                    self.connect()
+                }
+            }
+        }
+    }
+
+    private func cancelAutoReconnect() {
+        autoReconnectTimer?.invalidate()
+        autoReconnectTimer = nil
+        autoReconnectAttempt = 0
     }
 
     // MARK: - Sleep hook
@@ -528,6 +583,9 @@ final class VPNController: ObservableObject {
 
     private func handleWillSleep() {
         // willSleep 通知给应用 ~20s 窗口。cleanup 最多 12s，够用。
+        // 睡眠场景由 shouldReconnectAfterWake 走另一条 reconnect 路径，
+        // 取消掉这里 pollTick 触发的自动重连，避免两套机制打架
+        cancelAutoReconnect()
         shouldReconnectAfterWake = isConnected
         if useProxyMode {
             guard isConnected || OpenConnectRunner.isProxyModeRunning else { return }
