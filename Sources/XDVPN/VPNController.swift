@@ -24,9 +24,7 @@ final class VPNController: ObservableObject {
     @Published var password: String = ""
     @Published var rememberPassword: Bool = true
 
-    // MARK: - 分流（Split Tunnel）
-    /// 开关：打开 → 只把勾选/自定义的子网路由进 VPN；关 → def1 全流量
-    @Published var splitEnabled: Bool = false
+    // MARK: - 分流（Split Tunnel）—— 仅在 runningMode == .split 时生效
     @Published var splitPreset10: Bool = true      // 10.0.0.0/8
     @Published var splitPreset172: Bool = true     // 172.16.0.0/12
     @Published var splitPreset192: Bool = false    // 192.168.0.0/16（通常是本地 LAN）
@@ -37,7 +35,16 @@ final class VPNController: ObservableObject {
 
     // MARK: - 状态
 
-    @Published private(set) var isConnected: Bool = false
+    @Published private(set) var isConnected: Bool = false {
+        didSet {
+            // 任何路径让 VPN 断开（手动 / 休眠 / 异常死亡 / 唤醒重连前清理）
+            // 都把 SOCKS5 server 同步关掉 —— 它绑的 utun 接口已经无效
+            if !isConnected, oldValue {
+                socks5.stop()
+                socks5Active = false
+            }
+        }
+    }
     @Published private(set) var isBusy: Bool = false
     @Published private(set) var statusText: String = "未连接"
     @Published private(set) var sudoConfigured: Bool = SudoersInstaller.isInstalled
@@ -52,10 +59,83 @@ final class VPNController: ObservableObject {
     @Published private(set) var dnsProxyActive: Bool = false
     @Published private(set) var trafficIn: UInt64 = 0
     @Published private(set) var trafficOut: UInt64 = 0
+    /// 实时速率（字节/秒）—— 从两次 poll 之间的差值估算
+    @Published private(set) var trafficInRate: UInt64 = 0
+    @Published private(set) var trafficOutRate: UInt64 = 0
+    /// 菜单栏标题里是否外显实时速度
+    @Published var showSpeedInMenuBar: Bool = false {
+        didSet { UserDefaults.standard.set(showSpeedInMenuBar, forKey: "xdvpn.showSpeedInMenuBar") }
+    }
+
+    // MARK: - 运行模式（三选一）
+    /// 三种模式语义：
+    ///   - .proxy   纯代理：openconnect --script-tun + ocproxy 用户态，不动系统状态
+    ///   - .split   VPN 分流：标准模式，仅指定 CIDR 走 VPN，其它走本地默认
+    ///   - .full    VPN 全局：标准模式，所有流量走 VPN（def1）
+    enum RunningMode: String, CaseIterable, Identifiable {
+        case proxy, split, full
+        var id: String { rawValue }
+
+        var label: String {
+            switch self {
+            case .proxy: return "纯代理模式"
+            case .split: return "VPN 分流模式"
+            case .full:  return "VPN 全局模式"
+            }
+        }
+
+        var summary: String {
+            switch self {
+            case .proxy: return "不动系统路由 / DNS，只暴露 SOCKS5"
+            case .split: return "标准 VPN，仅指定网段走隧道"
+            case .full:  return "标准 VPN，所有外网流量走隧道"
+            }
+        }
+    }
+
+    @Published var runningMode: RunningMode = .split {
+        didSet { UserDefaults.standard.set(runningMode.rawValue, forKey: "xdvpn.runningMode") }
+    }
+
+    /// 兼容旧调用方：内部代码大量用 useProxyMode/splitEnabled 这两个 bool，
+    /// 通过 computed property 派生，保留单一数据源（runningMode）
+    var useProxyMode: Bool { runningMode == .proxy }
+    var splitEnabled: Bool {
+        get { runningMode == .split }
+        set {
+            // 兼容旧 UI：拖 split toggle 时只在 kernel 两种模式间切，不动 proxy
+            if useProxyMode { return }
+            runningMode = newValue ? .split : .full
+        }
+    }
+
+    // MARK: - SOCKS5 代理（给 Surge / Clash 这类客户端用）
+    @Published var socks5Enabled: Bool = true {
+        didSet {
+            UserDefaults.standard.set(socks5Enabled, forKey: "xdvpn.socks5.enabled")
+            applySocks5State()
+        }
+    }
+    @Published var socks5Port: Int = 5180 {
+        didSet {
+            UserDefaults.standard.set(socks5Port, forKey: "xdvpn.socks5.port")
+            applySocks5State()
+        }
+    }
+    @Published private(set) var socks5Active: Bool = false
+    @Published private(set) var socks5Error: String?
+
+    private let socks5 = Socks5Proxy()
 
     // MARK: - 私有
 
+    private var lastTrafficSample: (inBytes: UInt64, outBytes: UInt64, at: Date)?
     private var pollTimer: Timer?
+    /// 自动重连：连接突然死掉时跑的 backoff 重试。
+    /// 每次成功连上后清零，每次失败递增；超过 maxAttempts 就放弃
+    private var autoReconnectAttempt: Int = 0
+    private var autoReconnectTimer: Timer?
+    private let autoReconnectMaxAttempts = 5
     private var sleepObserver: NSObjectProtocol?
     private var wakeObserver: NSObjectProtocol?
     /// 睡前是否连着 → 醒来自动重连
@@ -63,8 +143,16 @@ final class VPNController: ObservableObject {
 
     init() {
         loadPrefs()
-        // Self-heal：启动时先清上次的残余（幂等，没残余就秒过）
-        // 只有 sudoers 已配的情况下才跑 —— 首次启动时 cleanup helper 还不存在
+        // Self-heal：启动时清两种模式可能残留的进程
+        //   - 标准模式：/tmp/xdvpn.pid 指的 openconnect + helper 启的 dns-proxy
+        //   - 纯代理模式：/tmp/xdvpn-proxy.pid 指的 openconnect (用户身份) + 它的 ocproxy 子进程
+        // 这两套必须分开清，否则上一次 GUI 被 kill 后留下的孤儿 VPN 会让新 GUI 显示"未连接"
+        // 但底层 SOCKS5 仍能用的诡异状态
+        Task.detached {
+            // 用户态的（无需 sudo），永远跑
+            OpenConnectRunner.disconnectProxyMode()
+        }
+        // root 那套需要 sudoers 已配 —— 首次启动时 cleanup helper 还不存在，跳过
         if sudoConfigured {
             runCleanupDetached(reason: "启动清理上次残余")
         }
@@ -89,7 +177,7 @@ final class VPNController: ObservableObject {
         d.set(server, forKey: "xdvpn.server")
         d.set(user, forKey: "xdvpn.user")
         d.set(rememberPassword, forKey: "xdvpn.remember")
-        d.set(splitEnabled, forKey: "xdvpn.split.enabled")
+        d.set(runningMode.rawValue, forKey: "xdvpn.runningMode")
         d.set(splitPreset10, forKey: "xdvpn.split.preset10")
         d.set(splitPreset172, forKey: "xdvpn.split.preset172")
         d.set(splitPreset192, forKey: "xdvpn.split.preset192")
@@ -103,12 +191,27 @@ final class VPNController: ObservableObject {
         server = d.string(forKey: "xdvpn.server") ?? ""
         user = d.string(forKey: "xdvpn.user") ?? ""
         rememberPassword = d.object(forKey: "xdvpn.remember") as? Bool ?? true
-        splitEnabled = d.object(forKey: "xdvpn.split.enabled") as? Bool ?? false
+
+        // 三态模式 —— 优先读新 key；如果没有，从旧 useProxyMode/splitEnabled 迁移
+        if let raw = d.string(forKey: "xdvpn.runningMode"),
+           let mode = RunningMode(rawValue: raw) {
+            runningMode = mode
+        } else {
+            let oldProxy = d.bool(forKey: "xdvpn.useProxyMode")
+            let oldSplit = (d.object(forKey: "xdvpn.split.enabled") as? Bool) ?? true
+            runningMode = oldProxy ? .proxy : (oldSplit ? .split : .full)
+        }
+
         splitPreset10 = d.object(forKey: "xdvpn.split.preset10") as? Bool ?? true
         splitPreset172 = d.object(forKey: "xdvpn.split.preset172") as? Bool ?? true
         splitPreset192 = d.object(forKey: "xdvpn.split.preset192") as? Bool ?? false
         splitCustom = d.string(forKey: "xdvpn.split.custom") ?? ""
         splitDomains = d.string(forKey: "xdvpn.split.domains") ?? ""
+        showSpeedInMenuBar = d.bool(forKey: "xdvpn.showSpeedInMenuBar")
+        // SOCKS5: 默认开启 + 5180 端口
+        socks5Enabled = (d.object(forKey: "xdvpn.socks5.enabled") as? Bool) ?? true
+        let savedPort = d.integer(forKey: "xdvpn.socks5.port")
+        socks5Port = (savedPort >= 1024 && savedPort <= 65535) ? savedPort : 5180
         if rememberPassword, !user.isEmpty, !server.isEmpty {
             password = KeychainStore.load(account: keychainAccount) ?? ""
         }
@@ -183,6 +286,19 @@ final class VPNController: ObservableObject {
         }
     }
 
+    // MARK: - SOCKS5 调度
+    //
+    // 历史遗留：早期标准模式下也跑过 Swift 写的 Socks5Proxy，
+    // 但这是设计错误 —— 让用户以为三种模式可叠加，实际它们应该互斥：
+    //   - 代理模式：SOCKS5 由 ocproxy 提供（openconnect 的 child）
+    //   - 分流/全局模式：kernel 自动路由，不需要 SOCKS5
+    // 现在这个函数永远只是 stop（防御性），不再启动 Swift Socks5Proxy。
+    func applySocks5State() {
+        socks5.stop()
+        socks5Active = false
+        socks5Error = nil
+    }
+
     nonisolated static func writeDomainConfFile(enabled: Bool, domains: [String]) {
         let path = domainConfPath
         if enabled, !domains.isEmpty {
@@ -194,7 +310,9 @@ final class VPNController: ObservableObject {
     }
 
     var canConnect: Bool {
-        sudoConfigured && !server.isEmpty && !user.isEmpty && !password.isEmpty
+        // 纯代理模式不需要 sudo（openconnect 以用户身份跑，不创建 utun）
+        let sudoOK = useProxyMode || sudoConfigured
+        return sudoOK && !server.isEmpty && !user.isEmpty && !password.isEmpty
             && !isBusy && !isConnected
     }
 
@@ -208,26 +326,35 @@ final class VPNController: ObservableObject {
         let p = protocolName, s = server, u = user, pw = password
         let remember = rememberPassword
         let account = keychainAccount
+        let proxyMode = useProxyMode
+        let socksPort = UInt16(socks5Port)
         let splitOn = splitEnabled
         let splitCIDRs = collectSplitCIDRs()
         let domainSuffixes = collectDomainSuffixes()
 
         Task.detached { [weak self] in
-            // 先 cleanup 确保干净起点（即使启动时跑过，用户可能在期间手动 kill 过什么）
-            try? OpenConnectRunner.cleanup()
+            // 先清两种模式的所有残留 —— 用户可能从对方模式切过来，旧进程还在
+            OpenConnectRunner.disconnectProxyMode()
+            try? OpenConnectRunner.cleanup()  // 即使 proxyMode，前一次标准模式的 root 进程也得清
 
-            // cleanup 会删 split conf；现在按当前 UI 状态重新写一遍
-            // 必须在 openconnect 启动之前，让路由脚本能读到
-            Self.writeSplitConfFile(enabled: splitOn, cidrs: splitCIDRs)
-            Self.writeDomainConfFile(enabled: splitOn, domains: domainSuffixes)
+            if !proxyMode {
+                Self.writeSplitConfFile(enabled: splitOn, cidrs: splitCIDRs)
+                Self.writeDomainConfFile(enabled: splitOn, domains: domainSuffixes)
+            }
 
             // 连接
             let result: Result<Void, Error>
             do {
                 try await BiometricGate.ensure()
-                try OpenConnectRunner.connect(
-                    protocolName: p, server: s, user: u, password: pw
-                )
+                if proxyMode {
+                    try OpenConnectRunner.connectProxyMode(
+                        protocolName: p, server: s, user: u, password: pw, socksPort: socksPort
+                    )
+                } else {
+                    try OpenConnectRunner.connect(
+                        protocolName: p, server: s, user: u, password: pw
+                    )
+                }
                 result = .success(())
             } catch {
                 result = .failure(error)
@@ -245,11 +372,20 @@ final class VPNController: ObservableObject {
                     }
                     self.savePrefs()
                     BiometricGate.markActivity()
+                    // 成功连上 → 重置自动重连计数（之后再断只算"新一轮"）
+                    self.autoReconnectAttempt = 0
                     self.isConnected = true
                     self.connectedAt = Date()
-                    self.parseSessionFile()
-                    self.updateTrafficStats()
-                    self.statusText = "已连接"
+                    if proxyMode {
+                        // 纯代理模式：ocproxy 已在 socksPort 暴露 SOCKS5
+                        self.statusText = "已连接（纯代理 · SOCKS5 127.0.0.1:\(socksPort)）"
+                        self.socks5Active = true
+                    } else {
+                        // 分流 / 全局模式：kernel 路由自动接管，不再启 Swift Socks5Proxy
+                        self.parseSessionFile()
+                        self.updateTrafficStats()
+                        self.statusText = "已连接"
+                    }
                 case .failure(let err):
                     if case VPNError.sudoNotConfigured = err {
                         self.sudoConfigured = false
@@ -263,14 +399,22 @@ final class VPNController: ObservableObject {
 
     func disconnect() {
         guard isConnected || isBusy == false else { return }
+        // 用户主动断开 → 取消任何待执行的自动重连
+        cancelAutoReconnect()
         isBusy = true
         statusText = "正在断开…"
 
+        let proxyMode = useProxyMode
+
         Task.detached { [weak self] in
-            let errMsg: String? = {
-                do { try OpenConnectRunner.cleanup(); return nil }
-                catch { return error.localizedDescription }
-            }()
+            let errMsg: String?
+            if proxyMode {
+                OpenConnectRunner.disconnectProxyMode()
+                errMsg = nil
+            } else {
+                do { try OpenConnectRunner.cleanup(); errMsg = nil }
+                catch { errMsg = error.localizedDescription }
+            }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.isBusy = false
@@ -327,29 +471,92 @@ final class VPNController: ObservableObject {
 
     private func startPolling() {
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        // 1s 心跳：实时速率（菜单栏外显）需要每秒刷新一次才有"动"的感觉
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.pollTick()
             }
         }
+        // .common 模式 → 菜单展开/拖窗等期间也继续 fire
+        RunLoop.main.add(timer, forMode: .common)
+        pollTimer = timer
     }
 
     private func pollTick() {
-        let running = OpenConnectRunner.isRunning
-        if isConnected, running {
+        // 按当前模式检查对应的 openconnect 进程是否还活着
+        let running = useProxyMode ? OpenConnectRunner.isProxyModeRunning : OpenConnectRunner.isRunning
+        if isConnected, running, !useProxyMode {
+            // 标准模式才采流量/解析 session；纯代理模式拿不到这些数据
             if tunnelInterface == nil { parseSessionFile() }
             updateTrafficStats()
         }
-        // 声明"连着"但 openconnect 没了 = 意外死亡 → 自动 cleanup
+        // 声明"连着"但进程没了 = 意外死亡 → 自动清理 + 重连
         if isConnected, !running, !isBusy {
             isBusy = true
             statusText = "连接已丢失，正在清理…"
-            runCleanupDetached(reason: "意外断开自动清理") { [weak self] in
-                self?.isConnected = false
-                self?.isBusy = false
-                self?.statusText = "未连接"
+            if useProxyMode {
+                Task.detached { [weak self] in
+                    OpenConnectRunner.disconnectProxyMode()
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        self.isConnected = false
+                        self.isBusy = false
+                        self.scheduleAutoReconnect()
+                    }
+                }
+            } else {
+                runCleanupDetached(reason: "意外断开自动清理") { [weak self] in
+                    guard let self else { return }
+                    self.isConnected = false
+                    self.isBusy = false
+                    self.scheduleAutoReconnect()
+                }
             }
         }
+    }
+
+    // MARK: - 自动重连（意外掉线场景）
+    //
+    // 触发：pollTick 检测到 isConnected=true 但 openconnect/ocproxy 进程没了。
+    // 策略：指数退避 1/2/4/8/16s，5 次都不行就放弃，状态栏给提示。
+    // 重置：每次手动 disconnect、休眠 willSleep、和成功连上后都清零计数。
+
+    private func scheduleAutoReconnect() {
+        autoReconnectTimer?.invalidate()
+        autoReconnectTimer = nil
+
+        // 没凭据 → 不可能重连，直接放弃
+        guard !server.isEmpty, !user.isEmpty, !password.isEmpty else {
+            statusText = "未连接（凭据不全，请手动连接）"
+            return
+        }
+
+        autoReconnectAttempt += 1
+        if autoReconnectAttempt > autoReconnectMaxAttempts {
+            statusText = "自动重连失败 \(autoReconnectMaxAttempts) 次，请手动重连"
+            autoReconnectAttempt = 0
+            return
+        }
+
+        // 1, 2, 4, 8, 16 秒
+        let delay = pow(2.0, Double(autoReconnectAttempt - 1))
+        statusText = "连接已丢失，\(Int(delay))s 后自动重连（第 \(autoReconnectAttempt)/\(autoReconnectMaxAttempts) 次）"
+
+        autoReconnectTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.autoReconnectTimer = nil
+                if !self.isConnected, self.canConnect {
+                    self.connect()
+                }
+            }
+        }
+    }
+
+    private func cancelAutoReconnect() {
+        autoReconnectTimer?.invalidate()
+        autoReconnectTimer = nil
+        autoReconnectAttempt = 0
     }
 
     // MARK: - Sleep hook
@@ -376,11 +583,18 @@ final class VPNController: ObservableObject {
 
     private func handleWillSleep() {
         // willSleep 通知给应用 ~20s 窗口。cleanup 最多 12s，够用。
-        // 只在确实连着 + sudo 已配 的情况下清；其他情况 noop 就行。
+        // 睡眠场景由 shouldReconnectAfterWake 走另一条 reconnect 路径，
+        // 取消掉这里 pollTick 触发的自动重连，避免两套机制打架
+        cancelAutoReconnect()
         shouldReconnectAfterWake = isConnected
-        guard sudoConfigured, isConnected || OpenConnectRunner.isRunning else { return }
-        // 同步跑（阻塞主线程，屏幕要黑掉了 UI 阻塞无所谓）
-        try? OpenConnectRunner.cleanup()
+        if useProxyMode {
+            guard isConnected || OpenConnectRunner.isProxyModeRunning else { return }
+            OpenConnectRunner.disconnectProxyMode()
+        } else {
+            // 只在 sudo 已配 的情况下清；其他情况 noop 就行
+            guard sudoConfigured, isConnected || OpenConnectRunner.isRunning else { return }
+            try? OpenConnectRunner.cleanup()
+        }
         isConnected = false
         clearDiagnostics()
         statusText = "未连接"
@@ -389,12 +603,31 @@ final class VPNController: ObservableObject {
     private func handleDidWake() {
         // 唤醒后 openconnect 进程可能还活着，但 VPN 服务端 session 已超时、
         // TLS/DTLS 连接已断，隧道实际是黑洞。进程活着 ≠ 隧道通。
-        // 先 cleanup 清残留，再根据睡前状态决定是否自动重连。
         let shouldReconnect = shouldReconnectAfterWake
         shouldReconnectAfterWake = false
 
-        guard sudoConfigured else { return }
+        if useProxyMode {
+            if isConnected || OpenConnectRunner.isProxyModeRunning {
+                isBusy = true
+                statusText = "休眠唤醒，正在清理…"
+                Task.detached { [weak self] in
+                    OpenConnectRunner.disconnectProxyMode()
+                    await MainActor.run { [weak self] in
+                        guard let self else { return }
+                        self.isConnected = false
+                        self.isBusy = false
+                        self.statusText = "未连接"
+                        if shouldReconnect { self.reconnectAfterWake() }
+                    }
+                }
+            } else if shouldReconnect {
+                reconnectAfterWake()
+            }
+            return
+        }
 
+        // 标准模式：走 sudo cleanup
+        guard sudoConfigured else { return }
         if isConnected || OpenConnectRunner.isRunning {
             isBusy = true
             statusText = "休眠唤醒，正在清理…"
@@ -406,7 +639,6 @@ final class VPNController: ObservableObject {
                 if shouldReconnect { self.reconnectAfterWake() }
             }
         } else if shouldReconnect {
-            // willSleep 已经清干净了，直接重连
             reconnectAfterWake()
         }
     }
@@ -446,6 +678,20 @@ final class VPNController: ObservableObject {
         guard let iface = tunnelInterface else { return }
         let info = Self.queryTunnel(iface)
         tunnelIP = info.ip
+
+        // 估算实时速率：当前样本 vs 上次样本
+        let now = Date()
+        if let last = lastTrafficSample {
+            let dt = now.timeIntervalSince(last.at)
+            if dt > 0.1 {
+                let dIn = info.bytesIn >= last.inBytes ? info.bytesIn - last.inBytes : 0
+                let dOut = info.bytesOut >= last.outBytes ? info.bytesOut - last.outBytes : 0
+                trafficInRate = UInt64(Double(dIn) / dt)
+                trafficOutRate = UInt64(Double(dOut) / dt)
+            }
+        }
+        lastTrafficSample = (info.bytesIn, info.bytesOut, now)
+
         trafficIn = info.bytesIn
         trafficOut = info.bytesOut
     }
@@ -459,6 +705,13 @@ final class VPNController: ObservableObject {
         dnsProxyActive = false
         trafficIn = 0
         trafficOut = 0
+        trafficInRate = 0
+        trafficOutRate = 0
+        lastTrafficSample = nil
+        // VPN 没了 socks 也必须停（出站绑的接口已无效）
+        socks5.stop()
+        socks5Active = false
+        socks5Error = nil
     }
 
     struct TunnelInfo {
@@ -527,6 +780,29 @@ final class VPNController: ObservableObject {
         var idx = 0
         while value >= 1024 && idx < units.count - 1 { value /= 1024; idx += 1 }
         return idx == 0 ? "\(bytes) B" : String(format: "%.1f %@", value, units[idx])
+    }
+
+    /// 固定 8 字符宽的速率格式（菜单栏标题用）—— 永远不抖
+    /// KB 为最小单位：
+    ///   "  0 KB/s"  < 1 KB
+    ///   " 12 KB/s"  / "999 KB/s"
+    ///   "1.5 MB/s"  / "9.9 MB/s"  (< 10 MB，一位小数)
+    ///   " 12 MB/s"  / "999 MB/s"  (≥ 10 MB，整数)
+    ///   "1.5 GB/s"  / "9.9 GB/s"
+    nonisolated static func formatRate(_ bps: UInt64) -> String {
+        let kb = Double(bps) / 1024.0
+
+        if kb < 1024 {
+            return String(format: "%3d KB/s", Int(kb))
+        }
+        let mb = kb / 1024.0
+        if mb < 1024 {
+            if mb < 10 { return String(format: "%.1f MB/s", mb) }
+            return String(format: "%3d MB/s", Int(mb))
+        }
+        let gb = mb / 1024.0
+        if gb < 10 { return String(format: "%.1f GB/s", gb) }
+        return String(format: "%3d GB/s", Int(gb))
     }
 
     // MARK: - Internal helpers

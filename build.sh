@@ -33,7 +33,10 @@ fi
 echo "==> vendoring openconnect"
 scripts/vendor-openconnect.sh "$APP"
 
-echo "==> signing bundled openconnect"
+echo "==> vendoring ocproxy"
+scripts/vendor-ocproxy.sh "$APP"
+
+echo "==> signing bundled openconnect + ocproxy"
 find "$APP/Contents/Resources/openconnect" -type f \( -perm +111 -o -name '*.dylib' \) -exec codesign --force --sign - {} \;
 
 # ad-hoc 签名（Icon.png 已就位，签名覆盖整个包）

@@ -28,6 +28,8 @@ enum VPNError: LocalizedError {
 enum OpenConnectRunner {
     /// openconnect 写的 pid 文件（/tmp，reboot 持久但 3 天无访问会被 periodic 清）
     static let pidPath = "/tmp/xdvpn.pid"
+    /// 纯代理模式独立 pid 文件（无 sudo，user-owned）
+    static let proxyModePidPath = "/tmp/xdvpn-proxy.pid"
 
     static let protocols = ["anyconnect", "nc", "gp", "pulse", "f5", "fortinet", "array"]
 
@@ -119,6 +121,160 @@ enum OpenConnectRunner {
 
     /// disconnect 和 cleanup 是完全同义的。提供别名让调用方代码更易读。
     static func disconnect() throws { try cleanup() }
+
+    // MARK: - 纯代理模式 (userspace, no sudo)
+    //
+    // openconnect --script-tun --script "ocproxy -D <port>" ...
+    //   - 不创建 utun → 不需要 sudo
+    //   - openconnect 把 IP 包通过 pipe 喂给 ocproxy
+    //   - ocproxy 用 lwIP 在用户态实现 TCP/IP 栈，暴露 SOCKS5
+    //   - 完全不动 macOS 路由表 / DNS resolver / 任何系统状态
+
+    /// 在 app bundle 里找 ocproxy，或回退到 brew 安装
+    static func locateOcproxy() -> String? {
+        if let resourcePath = Bundle.main.resourcePath {
+            let bundled = resourcePath + "/openconnect/bin/ocproxy"
+            if FileManager.default.isExecutableFile(atPath: bundled) {
+                return bundled
+            }
+        }
+        for path in ["/opt/homebrew/bin/ocproxy", "/usr/local/bin/ocproxy"] {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        return nil
+    }
+
+    /// 在 app bundle 里找 openconnect
+    static func locateBundledOpenconnect() -> String? {
+        guard let resourcePath = Bundle.main.resourcePath else { return nil }
+        let path = resourcePath + "/openconnect/bin/openconnect"
+        return FileManager.default.isExecutableFile(atPath: path) ? path : nil
+    }
+
+    /// 启动纯代理模式：openconnect + ocproxy，user 身份，无 sudo。
+    /// 调用线程：**不要** MainActor（同步阻塞等到 connect 完成）
+    static func connectProxyMode(
+        protocolName: String,
+        server: String,
+        user: String,
+        password: String,
+        socksPort: UInt16
+    ) throws {
+        guard protocols.contains(protocolName) else { throw VPNError.invalidProtocol }
+
+        guard let openconnectBin = locateBundledOpenconnect() else {
+            throw VPNError.connectFailed("找不到 bundled openconnect")
+        }
+        guard let ocproxyBin = locateOcproxy() else {
+            throw VPNError.connectFailed("找不到 ocproxy。请 brew install ocproxy，或重新打包 app")
+        }
+
+        // 清掉旧 pid 文件（防御性）
+        try? FileManager.default.removeItem(atPath: proxyModePidPath)
+
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: openconnectBin)
+        proc.arguments = [
+            "--background",
+            "--pid-file=" + proxyModePidPath,
+            "--script-tun",
+            // openconnect 通过 sh -c 执行 script string，所以 ocproxy 路径要 quote
+            "--script", "'\(ocproxyBin)' -D \(socksPort)",
+            "--protocol", protocolName,
+            "--user", user,
+            server,
+        ]
+
+        let stdin = Pipe()
+        let stderr = Pipe()
+        proc.standardInput = stdin
+        proc.standardError = stderr
+
+        do {
+            try proc.run()
+        } catch {
+            throw VPNError.connectFailed(error.localizedDescription)
+        }
+
+        stdin.fileHandleForWriting.write(Data((password + "\n").utf8))
+        try? stdin.fileHandleForWriting.close()
+
+        proc.waitUntilExit()
+
+        if proc.terminationStatus != 0 {
+            let errData = stderr.fileHandleForReading.readDataToEndOfFile()
+            let msg = String(data: errData, encoding: .utf8) ?? "exit \(proc.terminationStatus)"
+            throw VPNError.connectFailed(msg.trimmingCharacters(in: .whitespacesAndNewlines))
+        }
+    }
+
+    /// 断开纯代理模式：kill openconnect + ocproxy
+    /// 现实里 openconnect 死了 ocproxy 不一定跟着死（pipe 闭了 ocproxy 也可能继续 listen），
+    /// 所以两个都得显式清掉
+    static func disconnectProxyMode() {
+        // 1) 拿 openconnect 的 pid 从 pid-file 中
+        let ocPid: pid_t? = {
+            guard let s = try? String(contentsOfFile: proxyModePidPath, encoding: .utf8) else { return nil }
+            return pid_t(s.trimmingCharacters(in: .whitespacesAndNewlines))
+        }()
+        if let pid = ocPid {
+            killAndWait(pid)
+        }
+
+        // 2) 兜底：找孤儿 ocproxy 和 openconnect。**只匹配 bundle 里的绝对路径**，
+        //    避免误杀用户在别处装的 ocproxy / openconnect。
+        //    Bundle 路径形如 `XDVPN.app/Contents/Resources/openconnect/bin/<bin>`，
+        //    用 pgrep 的全路径匹配既能精确锁定我们启的进程，又能跨多份 .app 安装（如 dev + 生产）。
+        if let resourcePath = Bundle.main.resourcePath {
+            let ocproxyPath = resourcePath + "/openconnect/bin/ocproxy"
+            let openconnectPath = resourcePath + "/openconnect/bin/openconnect"
+            for pid in pidsMatching(command: ocproxyPath) { killAndWait(pid) }
+            for pid in pidsMatching(command: openconnectPath) { killAndWait(pid) }
+        }
+
+        try? FileManager.default.removeItem(atPath: proxyModePidPath)
+    }
+
+    private static func killAndWait(_ pid: pid_t) {
+        kill(pid, SIGTERM)
+        for _ in 0..<20 {  // 最多 2s
+            if kill(pid, 0) != 0 { break }
+            usleep(100_000)
+        }
+        if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
+    }
+
+    /// 用 `pgrep -f <pattern>` 找匹配命令行的 pid
+    private static func pidsMatching(command: String) -> [pid_t] {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        proc.arguments = ["-f", command]
+        let out = Pipe()
+        proc.standardOutput = out
+        proc.standardError = FileHandle.nullDevice
+        do {
+            try proc.run()
+            proc.waitUntilExit()
+        } catch { return [] }
+
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        return (String(data: data, encoding: .utf8) ?? "")
+            .split(separator: "\n")
+            .compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
+            .filter { $0 != ProcessInfo.processInfo.processIdentifier }  // 不杀自己
+    }
+
+    static var proxyModePid: pid_t? {
+        guard let s = try? String(contentsOfFile: proxyModePidPath, encoding: .utf8) else { return nil }
+        return pid_t(s.trimmingCharacters(in: .whitespacesAndNewlines))
+    }
+
+    static var isProxyModeRunning: Bool {
+        guard let pid = proxyModePid else { return false }
+        return isAlive(pid)
+    }
 
     // MARK: - Status query
 

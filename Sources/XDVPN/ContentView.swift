@@ -1,310 +1,800 @@
 import AppKit
 import SwiftUI
 
-struct ContentView: View {
+// MARK: - Design tokens
+
+enum Design {
+    /// 低饱和淡绿 —— Sonoma/Sequoia 系自然感主色
+    static let accent = Color(red: 0.42, green: 0.74, blue: 0.55)
+    /// 文字/icon 用的深色版本（可读性）
+    static let accentDeep = Color(red: 0.24, green: 0.52, blue: 0.36)
+    static let cardRadius: CGFloat = 14
+    static let fieldRadius: CGFloat = 8
+    static let chipRadius: CGFloat = 7
+
+    static let menuBarWidth: CGFloat = 280
+    static let mainWindowWidth: CGFloat = 480
+}
+
+// MARK: - Card container
+
+struct Card<Content: View>: View {
+    @ViewBuilder var content: Content
+    var padding: CGFloat = 14
+    var body: some View {
+        content
+            .padding(padding)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: Design.cardRadius, style: .continuous)
+                    .fill(Color.primary.opacity(0.045))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Design.cardRadius, style: .continuous)
+                    .stroke(Color.primary.opacity(0.06), lineWidth: 0.5)
+            )
+    }
+}
+
+// =====================================================================
+// MARK: - Main Window
+//
+// 一个真正的 NSWindow 内容视图。所有表单类操作都在这里完成，
+// 不会因为失焦而消失。
+// =====================================================================
+
+struct MainWindowView: View {
     @EnvironmentObject var vpn: VPNController
     @EnvironmentObject var updater: UpdateChecker
-    @State private var showAdvanced = false
+
+    @State private var diagExpanded = false
+    @State private var splitDetailsExpanded = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 4) {
-                Image(systemName: "shield.fill")
-                    .font(.system(size: 16))
-                    .foregroundStyle(vpn.isConnected ? .green : .secondary)
-                Text("XDVPN")
-                    .font(.headline)
-                Spacer()
-                Button {
-                    if updater.hasUpdate {
-                        updater.showUpdateWindow()
-                    } else {
-                        NSWorkspace.shared.open(URL(string: "https://github.com/kafeifei/XDVPN")!)
-                    }
-                } label: {
-                    HStack(spacing: 2) {
-                        Text(Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "")
-                            .font(.subheadline)
-                        if updater.hasUpdate {
-                            Circle()
-                                .fill(.orange)
-                                .frame(width: 6, height: 6)
-                                .offset(y: -4)
-                        }
-                    }
-                    .foregroundStyle(updater.hasUpdate ? AnyShapeStyle(.orange) : AnyShapeStyle(.tertiary))
+        ScrollView {
+            VStack(alignment: .leading, spacing: 14) {
+                // 顶部状态英雄区
+                StatusHero(compact: false)
+                    .padding(.bottom, 2)
+
+                AccountSection()
+
+                ModeSection()
+
+                if vpn.runningMode == .split {
+                    SplitTunnelSection(detailsExpanded: $splitDetailsExpanded)
                 }
-                .buttonStyle(.plain)
-                .onHover { hovering in
-                    if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
+
+                // 只有纯代理模式才展示 SOCKS5 配置 —— 别的模式 kernel 自动路由，
+                // 不需要 SOCKS5 这个出口（之前展示是设计错误，会让人以为
+                // 三种模式是叠加关系而不是互斥）
+                if vpn.runningMode == .proxy {
+                    ProxySection()
                 }
-                Button {
-                    NSWorkspace.shared.open(URL(string: "https://github.com/kafeifei/XDVPN")!)
-                } label: {
-                    Image(nsImage: .githubMark)
-                        .foregroundStyle(.tertiary)
+
+                if vpn.isConnected {
+                    DiagnosticsSection(isExpanded: $diagExpanded)
                 }
-                .buttonStyle(.plain)
-                .onHover { hovering in
-                    if hovering { NSCursor.pointingHand.push() } else { NSCursor.pop() }
-                }
+
+                PrimaryActionButton()
+                    .padding(.top, 2)
+
+                FooterRow()
             }
+            .padding(18)
+        }
+        .scrollIndicators(.hidden)   // 内容超出固定高度时仍可滚动，但滚动条隐形
+        .frame(width: Design.mainWindowWidth, height: 720)
+        .background(WindowBackground())
+    }
+}
 
-            VStack(spacing: 6) {
-                TextField("服务器地址", text: $vpn.server)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(vpn.isConnected || vpn.isBusy)
-                TextField("用户名", text: $vpn.user)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(vpn.isConnected || vpn.isBusy)
-                SecureField("密码", text: $vpn.password)
-                    .textFieldStyle(.roundedBorder)
-                    .disabled(vpn.isConnected || vpn.isBusy)
-            }
+/// 让窗口背景使用 macOS 默认的窗口色（避免出现纯白卡卡的感觉）
+private struct WindowBackground: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let v = NSVisualEffectView()
+        v.material = .windowBackground
+        v.blendingMode = .behindWindow
+        v.state = .active
+        return v
+    }
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
+}
 
-            Toggle("记住密码", isOn: $vpn.rememberPassword)
-                .font(.caption)
-                .disabled(vpn.isConnected || vpn.isBusy)
+// =====================================================================
+// MARK: - Shared components
+// =====================================================================
 
-            Divider()
+// MARK: Status hero
 
-            // 状态行
-            HStack(spacing: 6) {
+private struct StatusHero: View {
+    @EnvironmentObject var vpn: VPNController
+    let compact: Bool
+
+    var body: some View {
+        HStack(spacing: compact ? 10 : 12) {
+            ZStack {
+                Circle()
+                    .fill(dotColor.opacity(0.20))
+                    .frame(width: compact ? 30 : 44, height: compact ? 30 : 44)
                 Circle()
                     .fill(dotColor)
-                    .frame(width: 8, height: 8)
-                Text(vpn.statusText)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
-                Spacer()
+                    .frame(width: compact ? 10 : 14, height: compact ? 10 : 14)
+                    .shadow(color: dotColor.opacity(vpn.isConnected ? 0.5 : 0), radius: 5)
             }
-
-            // 按钮行
-            HStack(spacing: 8) {
-                if vpn.isConnected {
-                    Button { vpn.disconnect() } label: {
-                        Label("断开", systemImage: "power")
-                            .labelStyle(.titleAndIcon)
-                    }
-                    .buttonStyle(SubtleDisconnectButtonStyle())
-                        .disabled(vpn.isBusy)
-
-                    TimelineView(.periodic(from: .now, by: 1)) { _ in
-                        if let t = vpn.connectedAt {
-                            Text(VPNController.formatDuration(Int(Date().timeIntervalSince(t))))
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                        }
-                    }
-                } else if !vpn.sudoConfigured {
-                    Button("一键配置") { vpn.installSudoers(thenConnect: true) }
-                        .keyboardShortcut(.defaultAction)
-                        .controlSize(.small)
-                        .disabled(vpn.isBusy)
-                } else {
-                    Button("连接") { vpn.connect() }
-                        .keyboardShortcut(.defaultAction)
-                        .controlSize(.small)
-                        .disabled(!vpn.canConnect)
-                }
-
-                Spacer()
-
-                // 高级设置齿轮
-                Button {
-                    showAdvanced.toggle()
-                } label: {
-                    Image(systemName: "gearshape")
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .popover(isPresented: $showAdvanced, arrowEdge: .leading) {
-                    AdvancedSettingsPopover(vpn: vpn)
-                        .disabled(vpn.isConnected || vpn.isBusy)
-                }
-
-                // 更多菜单
-                Menu {
-                    if vpn.sudoConfigured {
-                        Button("卸载免密 sudo 配置") { vpn.uninstallSudoers() }
-                    }
-                    Divider()
-                    Button("退出 XDVPN") { NSApp.terminate(nil) }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-                .menuStyle(.borderlessButton)
-                .frame(width: 30)
-            }
-
-            // 连接详情（连接后直接显示）
-            if vpn.isConnected {
-                VStack(alignment: .leading, spacing: 0) {
-                    DiagRow("协议", vpn.protocolName)
-                    DiagRow("服务器", vpn.server)
-                    if let gw = vpn.vpnGateway { DiagRow("网关", gw) }
-                    if let iface = vpn.tunnelInterface { DiagRow("接口", iface) }
-                    if let ip = vpn.tunnelIP { DiagRow("地址", ip) }
-
-                    DiagRow("流量",
-                            "↑ \(VPNController.formatBytes(vpn.trafficOut))  ↓ \(VPNController.formatBytes(vpn.trafficIn))")
-
-                    if !vpn.activeRoutes.isEmpty {
-                        DiagRow("路由", vpn.activeRoutes.joined(separator: ", "))
-                    }
-                    DiagRow("分流", vpn.splitEnabled ? "启用" : "关闭")
-                    if vpn.dnsProxyActive { DiagRow("DNS 代理", "活跃") }
+            VStack(alignment: .leading, spacing: 2) {
+                Text(headline)
+                    .font(.system(size: compact ? 14 : 18, weight: .semibold))
+                if showSubtitle {
+                    Text(subtitle)
+                        .font(.system(size: compact ? 10 : 12))
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
                 }
             }
+            Spacer()
+            rightAccessory
         }
-        .padding(12)
-        .frame(width: 260)
+        .padding(.horizontal, compact ? 2 : 4)
+    }
+
+    @ViewBuilder
+    private var rightAccessory: some View {
+        if vpn.isConnected, let t = vpn.connectedAt {
+            VStack(alignment: .trailing, spacing: 2) {
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    Text(VPNController.formatDuration(Int(Date().timeIntervalSince(t))))
+                        .font(.system(size: compact ? 12 : 14, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                if !compact {
+                    Text("时长")
+                        .font(.system(size: 9))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+        } else if vpn.isBusy {
+            ProgressView().controlSize(.small)
+        }
     }
 
     private var dotColor: Color {
-        if vpn.isConnected { return .green }
+        if vpn.isConnected { return Design.accent }
         if vpn.isBusy { return .orange }
         return .secondary
     }
-}
-
-private struct SubtleDisconnectButtonStyle: ButtonStyle {
-    @Environment(\.isEnabled) private var isEnabled
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.system(.caption, weight: .medium))
-            .symbolVariant(.circle)
-            .foregroundStyle(foregroundColor(pressed: configuration.isPressed))
-            .padding(.horizontal, 9)
-            .frame(height: 24)
-            .background {
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .fill(backgroundColor(pressed: configuration.isPressed))
-            }
-            .overlay {
-                RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    .stroke(borderColor, lineWidth: 1)
-            }
-            .opacity(isEnabled ? 1 : 0.55)
+    private var headline: String {
+        if vpn.isConnected { return "已连接" }
+        if vpn.isBusy { return "处理中" }
+        return "未连接"
     }
-
-    private func backgroundColor(pressed: Bool) -> Color {
-        if !isEnabled { return Color.secondary.opacity(0.05) }
-        return Color.secondary.opacity(pressed ? 0.12 : 0.06)
+    private var subtitle: String {
+        // 优先 statusText；如果它和 headline 重复，回退到展示服务器名
+        let s = vpn.statusText.trimmingCharacters(in: .whitespaces)
+        if !s.isEmpty && s != headline { return s }
+        if vpn.isConnected { return vpn.server }
+        if !vpn.server.isEmpty { return "\(vpn.user.isEmpty ? "?" : vpn.user)@\(vpn.server)" }
+        return "尚未配置账户"
     }
-
-    private func foregroundColor(pressed: Bool) -> Color {
-        if !isEnabled { return Color.secondary }
-        return pressed ? Color.red.opacity(0.9) : Color.primary.opacity(0.78)
-    }
-
-    private var borderColor: Color {
-        isEnabled ? Color.secondary.opacity(0.22) : Color.secondary.opacity(0.14)
+    private var showSubtitle: Bool {
+        !subtitle.isEmpty
     }
 }
 
-// MARK: - 高级设置 Popover
+// MARK: Account section (main window) ─────────────────────────────────
 
-private struct AdvancedSettingsPopover: View {
-    @ObservedObject var vpn: VPNController
+private struct AccountSection: View {
+    @EnvironmentObject var vpn: VPNController
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("高级设置").font(.headline)
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                SectionHeader(icon: "person.crop.circle", title: "账户")
 
-            Picker("协议", selection: $vpn.protocolName) {
-                ForEach(OpenConnectRunner.protocols, id: \.self) { p in
-                    Text(p).tag(p)
+                VStack(spacing: 8) {
+                    FieldRow(icon: "network", placeholder: "服务器地址（如 vpn.example.com）", text: $vpn.server)
+                    FieldRow(icon: "person", placeholder: "用户名", text: $vpn.user)
+                    FieldRow(icon: "key", placeholder: "密码", text: $vpn.password, secure: true)
                 }
-            }
-            .pickerStyle(.menu)
+                .disabled(vpn.isConnected || vpn.isBusy)
 
-            Divider()
-
-            Toggle("分流模式（仅指定子网走 VPN）", isOn: $vpn.splitEnabled)
-
-            if vpn.splitEnabled {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("常见内网段").font(.caption).foregroundStyle(.secondary)
-                    Toggle("10.0.0.0/8", isOn: $vpn.splitPreset10)
-                    Toggle("172.16.0.0/12", isOn: $vpn.splitPreset172)
-                    Toggle("192.168.0.0/16（可能覆盖本地网络）", isOn: $vpn.splitPreset192)
-
-                    Text("自定义 CIDR（逗号或换行分隔）")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .padding(.top, 2)
-                    TextEditor(text: $vpn.splitCustom)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(height: 48)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 4)
-                                .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
-                        )
-
-                    Text("域名分流（一行一个域名后缀）")
-                        .font(.caption).foregroundStyle(.secondary)
-                        .padding(.top, 2)
-                    TextEditor(text: $vpn.splitDomains)
-                        .font(.system(.caption, design: .monospaced))
-                        .frame(height: 48)
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 4)
-                                .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
-                        )
+                HStack(spacing: 10) {
+                    Toggle("记住密码", isOn: $vpn.rememberPassword)
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+                        .font(.system(size: 12))
+                        .disabled(vpn.isConnected || vpn.isBusy)
+                    Spacer()
+                    Text("协议")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    Picker("", selection: $vpn.protocolName) {
+                        ForEach(OpenConnectRunner.protocols, id: \.self) { p in
+                            Text(p).tag(p)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .controlSize(.small)
+                    .frame(width: 130)
+                    .disabled(vpn.isConnected || vpn.isBusy)
                 }
-                .font(.caption)
             }
         }
-        .padding(14)
-        .frame(width: 280)
     }
 }
 
-// MARK: - Diagnostics Row
+// MARK: Mode section (3-way: proxy / split / full) ───────────────────
+
+private struct ModeSection: View {
+    @EnvironmentObject var vpn: VPNController
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: iconName)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("运行模式")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                }
+
+                Picker("", selection: $vpn.runningMode) {
+                    ForEach(VPNController.RunningMode.allCases) { mode in
+                        Text(mode.label).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .disabled(vpn.isConnected || vpn.isBusy)
+
+                Text(currentSummary)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if vpn.isConnected {
+                    Text("切换模式需先断开 VPN")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.orange)
+                }
+            }
+        }
+    }
+
+    private var iconName: String {
+        switch vpn.runningMode {
+        case .proxy: return "shippingbox"
+        case .split: return "arrow.triangle.branch"
+        case .full:  return "network"
+        }
+    }
+
+    private var currentSummary: String {
+        switch vpn.runningMode {
+        case .proxy:
+            return "纯代理：ocproxy 在用户态终结 VPN，不动系统路由 / DNS，不需要 sudo。所有流量必须经 SOCKS5 才走 VPN —— 配 Surge / curl --socks5 等客户端来用。"
+        case .split:
+            return "VPN 分流：创建 utun 接口，仅勾选的网段走 VPN，其它流量走本机默认网络。浏览器可直接访问内网域名。需要 sudo 配置。"
+        case .full:
+            return "VPN 全局：创建 utun，所有外网流量都走 VPN 隧道（def1）。本地 LAN 仍可用，但任何上网请求都从公司出口出。需要 sudo 配置。"
+        }
+    }
+}
+
+// MARK: Split CIDR section ─────────────────────────────────────────
+//
+// 仅在 runningMode == .split 时显示。配置哪些网段 / 域名走 VPN。
+
+private struct SplitTunnelSection: View {
+    @EnvironmentObject var vpn: VPNController
+    @Binding var detailsExpanded: Bool
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "arrow.triangle.branch")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Design.accentDeep)
+                    Text("分流网段 & 域名")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    if vpn.isConnected {
+                        Text("修改后需重连才生效")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.orange)
+                    }
+                }
+
+                Text(subtitle)
+                    .font(.system(size: 11))
+                    .foregroundStyle(.secondary)
+
+                Text("内网网段")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .padding(.top, 4)
+
+                HStack(spacing: 8) {
+                    CIDRChip(label: "10.0.0.0/8", isOn: $vpn.splitPreset10)
+                    CIDRChip(label: "172.16.0.0/12", isOn: $vpn.splitPreset172)
+                    CIDRChip(label: "192.168.0.0/16", isOn: $vpn.splitPreset192)
+                    Spacer()
+                }
+                .disabled(vpn.isBusy)
+
+                Button {
+                    withAnimation(.smooth(duration: 0.18)) { detailsExpanded.toggle() }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: detailsExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(detailsExpanded ? "收起自定义规则" : "自定义 CIDR / 域名")
+                            .font(.system(size: 11))
+                    }
+                    .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .padding(.top, 2)
+
+                if detailsExpanded {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("自定义 CIDR")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                        EditorBox(text: $vpn.splitCustom, height: 64,
+                                  placeholder: "一行一个或逗号分隔，如 172.20.0.0/16")
+
+                        Text("域名后缀（自动匹配所有子域）")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                            .padding(.top, 4)
+                        EditorBox(text: $vpn.splitDomains, height: 64,
+                                  placeholder: "一行一个，如 yourcompany.com")
+                    }
+                    .disabled(vpn.isBusy)
+                }
+            }
+        }
+    }
+
+    private var subtitle: String {
+        let c = vpn.collectSplitCIDRs().count
+        let d = vpn.collectDomainSuffixes().count
+        if c == 0 && d == 0 { return "尚未选择任何规则" }
+        var parts: [String] = []
+        // 注：这里返回 String 而非 Text，Swift 字符串插值不会按 locale 千位分隔，所以安全
+        if c > 0 { parts.append("\(c) 个网段") }
+        if d > 0 { parts.append("\(d) 个域名") }
+        return parts.joined(separator: " · ") + " 走 VPN"
+    }
+}
+
+// MARK: Proxy section (SOCKS5 for Surge / other clients) ─────────────
+
+private struct ProxySection: View {
+    @EnvironmentObject var vpn: VPNController
+    @State private var portText: String = ""
+    @State private var portFocused: Bool = false
+
+    var body: some View {
+        // 这个 section 只会在 runningMode == .proxy 时由 MainWindowView 渲染，
+        // 所以内部不再判断模式。SOCKS5 是纯代理模式的本质，没有开/关，只有端口配置。
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "personalhotspot")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(Design.accentDeep)
+                    Text("SOCKS5 出口（ocproxy）")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    statusBadge
+                }
+
+                HStack(spacing: 10) {
+                    Text("端口")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.secondary)
+                    TextField("5180", text: $portText)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(.body, design: .monospaced))
+                        .frame(width: 80)
+                        .onSubmit { commitPort() }
+                        .disabled(vpn.isConnected || vpn.isBusy)
+                    Spacer()
+                }
+
+                Text(verbatim: "客户端连接地址：127.0.0.1:\(vpn.socks5Port)")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+
+                if !vpn.isConnected {
+                    Text("VPN 连接后 ocproxy 自动启动")
+                        .font(.system(size: 11))
+                        .foregroundStyle(.tertiary)
+                }
+
+                if vpn.socks5Active {
+                    copyConfigButton
+                }
+            }
+        }
+        .onAppear { portText = String(vpn.socks5Port) }
+        .onChange(of: vpn.socks5Port) { _, new in portText = String(new) }
+    }
+
+    private func commitPort() {
+        if let p = Int(portText.trimmingCharacters(in: .whitespaces)),
+           (1024...65535).contains(p) {
+            vpn.socks5Port = p
+        }
+        // 不管成功失败，UI 都回到当前真实端口值
+        portText = String(vpn.socks5Port)
+    }
+
+    @ViewBuilder
+    private var statusBadge: some View {
+        if vpn.socks5Active {
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(Design.accent)
+                    .frame(width: 6, height: 6)
+                    .shadow(color: Design.accent.opacity(0.5), radius: 2)
+                Text("运行中")
+                    .font(.system(size: 10))
+                    .foregroundStyle(.secondary)
+            }
+        } else if vpn.socks5Error != nil {
+            HStack(spacing: 4) {
+                Circle().fill(.red).frame(width: 6, height: 6)
+                Text("出错").font(.system(size: 10)).foregroundStyle(.red)
+            }
+        } else if !vpn.isConnected {
+            Text("待 VPN 连接")
+                .font(.system(size: 10))
+                .foregroundStyle(.tertiary)
+        }
+    }
+
+    private var copyConfigButton: some View {
+        let snippet = """
+        [Proxy]
+        XDVPN = socks5, 127.0.0.1, \(vpn.socks5Port)
+
+        [Rule]
+        # 让你想走公司出口的域名 / IP 段走 XDVPN
+        DOMAIN-SUFFIX,xindong.com,XDVPN
+        DOMAIN-SUFFIX,tapsvc.com,XDVPN
+        """
+        return Button {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(snippet, forType: .string)
+        } label: {
+            HStack(spacing: 4) {
+                Image(systemName: "doc.on.clipboard")
+                    .font(.system(size: 10))
+                Text("复制 Surge 配置片段")
+                    .font(.system(size: 11))
+            }
+            .foregroundStyle(.secondary)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: Diagnostics section ─────────────────────────────────────────
+
+private struct DiagnosticsSection: View {
+    @EnvironmentObject var vpn: VPNController
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        Card {
+            VStack(alignment: .leading, spacing: 10) {
+                HStack(spacing: 8) {
+                    Image(systemName: "waveform.path.ecg")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text("诊断")
+                        .font(.system(size: 13, weight: .semibold))
+                    Spacer()
+                    // 纯代理模式没 utun，拿不到流量；其它两种模式才展示
+                    if !vpn.useProxyMode {
+                        StatChip(icon: "arrow.up.right", value: VPNController.formatBytes(vpn.trafficOut))
+                        StatChip(icon: "arrow.down.left", value: VPNController.formatBytes(vpn.trafficIn))
+                    }
+                    Button {
+                        withAnimation(.smooth(duration: 0.18)) { isExpanded.toggle() }
+                    } label: {
+                        Image(systemName: isExpanded ? "chevron.up" : "chevron.down")
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if isExpanded {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 3) {
+                        DiagRow("模式", vpn.runningMode.label)
+                        DiagRow("协议", vpn.protocolName)
+                        DiagRow("服务器", vpn.server)
+                        if let gw = vpn.vpnGateway { DiagRow("网关", gw) }
+                        if let iface = vpn.tunnelInterface { DiagRow("接口", iface) }
+                        if let ip = vpn.tunnelIP { DiagRow("地址", ip) }
+                        if !vpn.activeRoutes.isEmpty {
+                            DiagRow("路由", vpn.activeRoutes.joined(separator: ", "))
+                        }
+                        if vpn.useProxyMode {
+                            DiagRow("SOCKS5", "127.0.0.1:\(vpn.socks5Port)")
+                            DiagRow("流量统计", "—（用户态模式不可用）")
+                        }
+                        if vpn.dnsProxyActive { DiagRow("DNS 代理", "活跃") }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// MARK: Footer (main window) ─────────────────────────────────
+
+private struct FooterRow: View {
+    @EnvironmentObject var vpn: VPNController
+    @EnvironmentObject var updater: UpdateChecker
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("v\(versionString)")
+                .font(.system(size: 11))
+                .foregroundStyle(.tertiary)
+            if updater.hasUpdate {
+                Button("有新版本…") { updater.showUpdateWindow() }
+                    .font(.system(size: 11))
+                    .buttonStyle(.link)
+                    .foregroundStyle(.orange)
+            }
+            Spacer()
+            Button("GitHub") {
+                if let u = URL(string: "https://github.com/kafeifei/XDVPN") {
+                    NSWorkspace.shared.open(u)
+                }
+            }
+            .font(.system(size: 11))
+            .buttonStyle(.link)
+            if vpn.sudoConfigured {
+                Text("·").font(.system(size: 11)).foregroundStyle(.tertiary)
+                Button("卸载 sudo") { vpn.uninstallSudoers() }
+                    .font(.system(size: 11))
+                    .buttonStyle(.link)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private var versionString: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    }
+}
+
+// =====================================================================
+// MARK: - Reusable atoms
+// =====================================================================
+
+private struct SectionHeader: View {
+    let icon: String
+    let title: String
+    var body: some View {
+        HStack(spacing: 6) {
+            Image(systemName: icon)
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+            Text(title)
+                .font(.system(size: 13, weight: .semibold))
+            Spacer()
+        }
+    }
+}
+
+private struct FieldRow: View {
+    let icon: String
+    let placeholder: String
+    @Binding var text: String
+    var secure: Bool = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: icon)
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+            Group {
+                if secure {
+                    SecureField(placeholder, text: $text)
+                } else {
+                    TextField(placeholder, text: $text)
+                }
+            }
+            .textFieldStyle(.plain)
+            .font(.system(size: 13))
+        }
+        .padding(.horizontal, 10).padding(.vertical, 8)
+        .background(
+            RoundedRectangle(cornerRadius: Design.fieldRadius, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+        )
+    }
+}
+
+private struct CIDRChip: View {
+    let label: String
+    @Binding var isOn: Bool
+
+    var body: some View {
+        Button {
+            isOn.toggle()
+        } label: {
+            HStack(spacing: 4) {
+                if isOn {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 9, weight: .bold))
+                }
+                Text(label)
+                    .font(.system(size: 11, weight: .medium, design: .monospaced))
+            }
+            .padding(.horizontal, 9).padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: Design.chipRadius, style: .continuous)
+                    .fill(isOn ? Design.accent.opacity(0.22) : Color.secondary.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: Design.chipRadius, style: .continuous)
+                    .stroke(isOn ? Design.accent.opacity(0.45) : Color.clear, lineWidth: 1)
+            )
+            .foregroundStyle(isOn ? Design.accentDeep : Color.secondary)
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+private struct EditorBox: View {
+    @Binding var text: String
+    let height: CGFloat
+    let placeholder: String
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            RoundedRectangle(cornerRadius: Design.fieldRadius, style: .continuous)
+                .fill(Color.primary.opacity(0.05))
+            TextEditor(text: $text)
+                .font(.system(.caption, design: .monospaced))
+                .scrollContentBackground(.hidden)
+                .padding(.horizontal, 6).padding(.vertical, 4)
+            if text.isEmpty {
+                Text(placeholder)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.tertiary)
+                    .padding(.horizontal, 10).padding(.vertical, 8)
+                    .allowsHitTesting(false)
+            }
+        }
+        .frame(height: height)
+    }
+}
+
+private struct StatChip: View {
+    let icon: String
+    let value: String
+    var body: some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 9, weight: .semibold))
+            Text(value).font(.system(size: 11, weight: .medium, design: .monospaced))
+        }
+        .padding(.horizontal, 7).padding(.vertical, 3)
+        .background(
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(Color.secondary.opacity(0.10))
+        )
+        .foregroundStyle(.secondary)
+    }
+}
 
 private struct DiagRow: View {
     let label: String
     let value: String
-
     init(_ label: String, _ value: String) {
         self.label = label
         self.value = value
     }
-
     var body: some View {
-        HStack(alignment: .top, spacing: 0) {
+        HStack(alignment: .top, spacing: 8) {
             Text(label)
-                .foregroundStyle(.secondary)
                 .frame(width: 56, alignment: .trailing)
-            Text("  ")
+                .foregroundStyle(.tertiary)
             Text(value)
+                .textSelection(.enabled)
+                .lineLimit(2)
+                .truncationMode(.middle)
         }
-        .font(.system(.caption, design: .monospaced))
-        .textSelection(.enabled)
-        .padding(.vertical, 1)
+        .font(.system(size: 11, design: .monospaced))
     }
 }
 
-extension NSImage {
-    static let githubMark: NSImage = {
-        let svg = """
-        <svg width="16" height="16" viewBox="0 0 16 16" xmlns="http://www.w3.org/2000/svg">\
-        <path fill="black" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 \
-        7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69\
-        -.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 \
-        1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64\
-        -.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 \
-        .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 \
-        2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 \
-        3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 \
-        2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>\
-        </svg>
-        """
-        let img = NSImage(data: Data(svg.utf8)) ?? NSImage()
-        img.isTemplate = true
-        return img
-    }()
+// MARK: Primary action button ─────────────────────────────────────
+
+private struct PrimaryActionButton: View {
+    @EnvironmentObject var vpn: VPNController
+
+    var body: some View {
+        Button(action: tap) {
+            HStack(spacing: 6) {
+                if vpn.isBusy {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Image(systemName: iconName)
+                        .font(.system(size: 13, weight: .semibold))
+                }
+                Text(label)
+                    .font(.system(size: 13, weight: .semibold))
+            }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 11)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(buttonBg)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .stroke(vpn.isConnected ? Color.primary.opacity(0.10) : Color.clear, lineWidth: 0.5)
+            )
+            .foregroundStyle(buttonFg)
+        }
+        .buttonStyle(.plain)
+        .disabled(disabled)
+        .keyboardShortcut(.defaultAction)
+    }
+
+    /// 纯代理模式不依赖 sudo（openconnect 以用户身份跑），不应被 sudo install 流程拦住
+    private var needsSudoBootstrap: Bool {
+        !vpn.useProxyMode && !vpn.sudoConfigured
+    }
+
+    private func tap() {
+        if vpn.isConnected { vpn.disconnect() }
+        else if needsSudoBootstrap { vpn.installSudoers(thenConnect: true) }
+        else { vpn.connect() }
+    }
+
+    private var iconName: String {
+        if vpn.isConnected { return "power.circle.fill" }
+        if needsSudoBootstrap { return "wand.and.stars" }
+        return "link"
+    }
+    private var label: String {
+        if vpn.isBusy { return "请稍候…" }
+        if vpn.isConnected { return "断开连接" }
+        if needsSudoBootstrap { return "首次配置并连接" }
+        return "连接"
+    }
+    private var buttonBg: Color {
+        if vpn.isConnected { return Color.secondary.opacity(0.12) }
+        if disabled { return Design.accent.opacity(0.30) }
+        return Design.accent
+    }
+    private var buttonFg: Color {
+        vpn.isConnected ? .primary : .white
+    }
+    private var disabled: Bool {
+        if vpn.isBusy { return true }
+        if vpn.isConnected { return false }
+        if needsSudoBootstrap { return false }
+        return !vpn.canConnect
+    }
 }
