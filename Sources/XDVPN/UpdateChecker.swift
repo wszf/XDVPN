@@ -25,7 +25,8 @@ final class UpdateChecker: ObservableObject {
         check()
         pollTimer?.invalidate()
         pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.check() }
+            guard let self else { return }
+            Task { @MainActor in self.check() }
         }
     }
 
@@ -152,9 +153,10 @@ final class UpdateChecker: ObservableObject {
                     try FileManager.default.setAttributes(
                         [.posixPermissions: 0o755], ofItemAtPath: scriptPath.path)
 
+                    let s = self
                     Task { @MainActor in
-                        self?.statusText = "更新就绪，正在重启…"
-                        self?.downloadProgress = 1.0
+                        s?.statusText = "更新就绪，正在重启…"
+                        s?.downloadProgress = 1.0
 
                         try? await Task.sleep(nanoseconds: 1_200_000_000)
 
@@ -168,13 +170,13 @@ final class UpdateChecker: ObservableObject {
                         exit(0)
                     }
                 } catch {
+                    let s = self
                     Task { @MainActor in
-                        self?.isDownloading = false
-                        self?.statusText = "更新失败"
+                        s?.isDownloading = false
+                        s?.statusText = "更新失败"
                         try? FileManager.default.removeItem(at: tempDir)
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                            self?.statusText = nil
-                        }
+                        try? await Task.sleep(nanoseconds: 3_000_000_000)
+                        s?.statusText = nil
                     }
                 }
             }

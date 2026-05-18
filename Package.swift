@@ -10,6 +10,7 @@ let package = Package(
             path: "Sources/XDVPN",
             swiftSettings: [
                 .define("DEBUG", .when(configuration: .debug)),
+                .enableExperimentalFeature("StrictConcurrency"),
             ]
         ),
         .executableTarget(
