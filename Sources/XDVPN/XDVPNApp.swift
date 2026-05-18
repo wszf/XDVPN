@@ -23,16 +23,14 @@ extension EnvironmentValues {
 
 // MARK: - App
 //
-// 注意：不要加 @main —— main.swift 已经做了防双开检查后手动调 XDVPNApp.main()
-// 整个菜单栏和主窗口都由 AppDelegate 用 AppKit 原生方式管理，
-// 这里只提供一个空 Settings scene 作为 SwiftUI App 协议的最低占位。
-struct XDVPNApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) var appDelegate
-
-    var body: some Scene {
-        Settings { EmptyView() }
-    }
-}
+// 注意：这里没有 SwiftUI App 壳 —— 启动入口在 main.swift，纯 AppKit
+// (NSApplication.shared + AppDelegate + run())。
+//
+// 历史背景：1.5.0 重构后曾保留 `struct XDVPNApp: App { Settings { EmptyView() } }`
+// 作为占位 scene，但 LSUIElement App 在通过 `open` 命令拉起（如更新流程）
+// 时会偶发蹦出一个空 Settings 窗口。彻底去掉 SwiftUI App 协议根除此问题。
+// 所有 UI 视图（ContentView.swift / UpdateWindowView 等）仍然是 SwiftUI，
+// 通过 NSHostingController 嵌进 NSWindow。
 
 // MARK: - Menu bar icon
 //
