@@ -163,6 +163,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItem()
         observeState()
+
+        // 启动时自动连接（远程维护机器场景）
+        c.autoConnectIfNeeded()
     }
 
     // MARK: status item

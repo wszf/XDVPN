@@ -23,6 +23,10 @@ final class VPNController: ObservableObject {
     @Published var user: String = ""
     @Published var password: String = ""
     @Published var rememberPassword: Bool = true
+    /// 启动时自动连接 —— 远程维护机器场景：开机/重启后无需人工操作即可上线
+    @Published var autoConnectOnLaunch: Bool = false {
+        didSet { UserDefaults.standard.set(autoConnectOnLaunch, forKey: "xdvpn.autoConnectOnLaunch") }
+    }
 
     // MARK: - 分流（Split Tunnel）—— 仅在 runningMode == .split 时生效
     @Published var splitPreset10: Bool = true      // 10.0.0.0/8
@@ -177,6 +181,7 @@ final class VPNController: ObservableObject {
         d.set(server, forKey: "xdvpn.server")
         d.set(user, forKey: "xdvpn.user")
         d.set(rememberPassword, forKey: "xdvpn.remember")
+        d.set(autoConnectOnLaunch, forKey: "xdvpn.autoConnectOnLaunch")
         d.set(runningMode.rawValue, forKey: "xdvpn.runningMode")
         d.set(splitPreset10, forKey: "xdvpn.split.preset10")
         d.set(splitPreset172, forKey: "xdvpn.split.preset172")
@@ -191,6 +196,7 @@ final class VPNController: ObservableObject {
         server = d.string(forKey: "xdvpn.server") ?? ""
         user = d.string(forKey: "xdvpn.user") ?? ""
         rememberPassword = d.object(forKey: "xdvpn.remember") as? Bool ?? true
+        autoConnectOnLaunch = d.bool(forKey: "xdvpn.autoConnectOnLaunch")
 
         // 三态模式 —— 优先读新 key；如果没有，从旧 useProxyMode/splitEnabled 迁移
         if let raw = d.string(forKey: "xdvpn.runningMode"),
@@ -317,6 +323,19 @@ final class VPNController: ObservableObject {
     }
 
     // MARK: - 用户动作
+
+    /// 启动后调用：如果用户开了"启动时自动连接"且凭据齐全，就发起一次连接。
+    /// 给 init 里的 self-heal cleanup 一点时间跑完，再走正常 connect 流程
+    /// （connect 内部会再做一次 cleanup，所以即便 cleanup 还没跑完也安全）。
+    func autoConnectIfNeeded() {
+        guard autoConnectOnLaunch else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self else { return }
+            // canConnect 已经覆盖了：sudo 状态、凭据齐全、未在连接中
+            if self.canConnect { self.connect() }
+        }
+    }
 
     func connect() {
         guard canConnect else { return }

@@ -222,6 +222,22 @@ private struct AccountSection: View {
                     .frame(width: 130)
                     .disabled(vpn.isConnected || vpn.isBusy)
                 }
+
+                // 启动时自动连接 —— 远程维护机器（SSH 上去开机）的常见诉求。
+                // 必须配合"记住密码"才有意义（否则启动时密码栏为空，canConnect=false 静默跳过）。
+                HStack(spacing: 6) {
+                    Toggle("启动时自动连接", isOn: $vpn.autoConnectOnLaunch)
+                        .toggleStyle(.checkbox)
+                        .controlSize(.small)
+                        .font(.system(size: 12))
+                        .disabled(!vpn.rememberPassword)
+                    if !vpn.rememberPassword {
+                        Text("需先开启「记住密码」")
+                            .font(.system(size: 10))
+                            .foregroundStyle(.tertiary)
+                    }
+                    Spacer()
+                }
             }
         }
     }
