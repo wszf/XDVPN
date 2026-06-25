@@ -1,4 +1,4 @@
-allowed_minor=9.12
+allowed_minor=9.21
 version_policy=allow_patch_updates_only
 source=Homebrew formula openconnect
 license=LGPL-2.1-only
