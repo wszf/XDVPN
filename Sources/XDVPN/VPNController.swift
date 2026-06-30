@@ -410,17 +410,17 @@ final class VPNController: ObservableObject {
 
     // MARK: - 用户动作
 
-    func selectMode(_ mode: RunningMode) {
+    func selectMode(_ mode: RunningMode, presentingWindow: NSWindow? = nil) {
         guard mode != runningMode, !isBusy else { return }
         guard isConnected else {
             runningMode = mode
             savePrefs()
             return
         }
-        confirmModeSwitch(to: mode)
+        confirmModeSwitch(to: mode, presentingWindow: presentingWindow)
     }
 
-    private func confirmModeSwitch(to targetMode: RunningMode) {
+    private func confirmModeSwitch(to targetMode: RunningMode, presentingWindow: NSWindow?) {
         let currentMode = activeMode ?? runningMode
         guard targetMode != currentMode else { return }
 
@@ -430,9 +430,25 @@ final class VPNController: ObservableObject {
         alert.informativeText = "这会先断开当前的\(currentMode.label)，然后用\(targetMode.label)重新连接。"
         alert.addButton(withTitle: "切换并重连")
         alert.addButton(withTitle: "取消")
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        switchModeAndReconnect(to: targetMode)
+        if let window = sheetParentWindow(preferred: presentingWindow) {
+            alert.beginSheetModal(for: window) { [weak self] response in
+                guard response == .alertFirstButtonReturn else { return }
+                Task { @MainActor [weak self] in
+                    self?.switchModeAndReconnect(to: targetMode)
+                }
+            }
+        } else {
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+            switchModeAndReconnect(to: targetMode)
+        }
+    }
+
+    private func sheetParentWindow(preferred: NSWindow?) -> NSWindow? {
+        let candidates = [preferred, NSApp.keyWindow, NSApp.mainWindow] + NSApp.windows
+        return candidates.compactMap { $0 }.first {
+            $0.isVisible && !$0.isSheet && $0.canBecomeKey
+        }
     }
 
     private func switchModeAndReconnect(to targetMode: RunningMode) {

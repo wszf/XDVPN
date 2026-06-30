@@ -290,7 +290,7 @@ private struct ModeSection: View {
     private var modeSelection: Binding<VPNController.RunningMode> {
         Binding(
             get: { vpn.runningMode },
-            set: { vpn.selectMode($0) }
+            set: { vpn.selectMode($0, presentingWindow: NSApp.keyWindow) }
         )
     }
 
