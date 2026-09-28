@@ -500,6 +500,11 @@ private struct WiFiOnDemandSettingsView: View {
         .onAppear {
             vpn.refreshWiFiSSID(requestPermissionIfNeeded: true)
         }
+        .onChange(of: vpn.currentWiFiSSID, initial: true) { previous, current in
+            if manualSSID.isEmpty || manualSSID == (previous ?? "") {
+                manualSSID = current ?? ""
+            }
+        }
     }
 
     private var currentWiFiSection: some View {
