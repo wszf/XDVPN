@@ -544,7 +544,6 @@ final class VPNController: ObservableObject {
     }
 
     func addCurrentWiFiRule(action: WiFiOnDemandAction) {
-        _ = refreshCurrentWiFiSSID()
         guard let ssid = currentWiFiSSID else {
             wifiSSIDReader.requestLocationPermissionIfNeeded()
             scheduleWiFiSSIDFallback(trigger: "添加当前 Wi-Fi", minInterval: 0)
