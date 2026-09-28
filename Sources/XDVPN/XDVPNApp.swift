@@ -163,6 +163,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: lifecycle
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        DistributedNotificationCenter.default().addObserver(
+            self,
+            selector: #selector(handleOpenMainWindow(_:)),
+            name: openMainWindowNotification,
+            object: String(ProcessInfo.processInfo.processIdentifier)
+        )
+
         let c = VPNController()
         controller = c
         updater = UpdateChecker()
@@ -357,6 +364,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: window
+
+    @objc private func handleOpenMainWindow(_ notification: Notification) {
+        showMainWindow()
+    }
 
     func showMainWindow() {
         if mainWindow == nil {

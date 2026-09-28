@@ -1,19 +1,22 @@
 import AppKit
 
+let openMainWindowNotification = Notification.Name("com.kafeifei.xdvpn.openMainWindow")
+
 // 防双开：在 AppDelegate / VPNController 初始化之前检测
 let me = NSRunningApplication.current
-let others = NSRunningApplication.runningApplications(
-    withBundleIdentifier: me.bundleIdentifier ?? ""
-).filter { $0 != me }
+let bundleIdentifier = me.bundleIdentifier ?? Bundle.main.bundleIdentifier
+let others = NSWorkspace.shared.runningApplications.filter { app in
+    guard app.processIdentifier != me.processIdentifier else { return false }
+    return (bundleIdentifier != nil && app.bundleIdentifier == bundleIdentifier)
+        || (me.executableURL != nil && app.executableURL == me.executableURL)
+}
 
-if !others.isEmpty {
-    _ = NSApplication.shared
-    let alert = NSAlert()
-    alert.messageText = "XDVPN 已在运行"
-    alert.informativeText = "请在菜单栏找到 XDVPN 图标。"
-    alert.alertStyle = .informational
-    alert.addButton(withTitle: "确认")
-    alert.runModal()
+if let existing = others.first {
+    DistributedNotificationCenter.default().post(
+        name: openMainWindowNotification,
+        object: String(existing.processIdentifier),
+        userInfo: nil
+    )
     exit(0)
 }
 
