@@ -52,6 +52,8 @@ final class VPNController: ObservableObject {
 
     @Published var protocolName: String = "anyconnect"
     @Published var server: String = ""
+    /// 认证组，可选。服务器登录页有「组」下拉框时才需要填。
+    @Published var authGroup: String = ""
     @Published var user: String = ""
     @Published var password: String = ""
     @Published var rememberPassword: Bool = true
@@ -432,6 +434,7 @@ final class VPNController: ObservableObject {
         let d = UserDefaults.standard
         d.set(protocolName, forKey: "xdvpn.protocol")
         d.set(server, forKey: "xdvpn.server")
+        d.set(authGroup, forKey: "xdvpn.authGroup")
         d.set(user, forKey: "xdvpn.user")
         d.set(rememberPassword, forKey: "xdvpn.remember")
         d.set(autoConnectOnLaunch, forKey: "xdvpn.autoConnectOnLaunch")
@@ -452,6 +455,7 @@ final class VPNController: ObservableObject {
         let d = UserDefaults.standard
         protocolName = d.string(forKey: "xdvpn.protocol") ?? "anyconnect"
         server = d.string(forKey: "xdvpn.server") ?? ""
+        authGroup = d.string(forKey: "xdvpn.authGroup") ?? ""
         user = d.string(forKey: "xdvpn.user") ?? ""
         rememberPassword = d.object(forKey: "xdvpn.remember") as? Bool ?? true
         autoConnectOnLaunch = d.bool(forKey: "xdvpn.autoConnectOnLaunch")
@@ -940,7 +944,6 @@ final class VPNController: ObservableObject {
                 }
             }
             guard let self else { return }
-            self.isBusy = false
             self.isConnected = false
             self.activeMode = nil
             self.clearDiagnostics()
@@ -951,6 +954,7 @@ final class VPNController: ObservableObject {
                 self.statusText = "已因 Wi-Fi「\(ssid)」断开 VPN"
                 appLog(.info, "已因 Wi-Fi「\(ssid)」断开 VPN")
             }
+            self.isBusy = false
         }
     }
 
@@ -1051,16 +1055,17 @@ final class VPNController: ObservableObject {
             }
 
             guard let self else { return }
-            self.isBusy = false
             if let errMsg {
                 self.statusText = "切换失败：\(errMsg)"
                 appLog(.error, "切换模式清理失败：\(errMsg)")
+                self.isBusy = false
                 return
             }
 
             self.isConnected = false
             self.activeMode = nil
             self.clearDiagnostics()
+            self.isBusy = false
             self.switchToModeAndConnectIfPossible(targetMode)
         }
     }
@@ -1117,7 +1122,7 @@ final class VPNController: ObservableObject {
         let mode = runningMode
         appLog(.info, silent ? "开始自动重连（\(mode.label)）" : "用户发起连接（\(mode.label)）")
 
-        let p = protocolName, s = server, u = user, pw = password
+        let p = protocolName, s = server, g = authGroup, u = user, pw = password
         let remember = rememberPassword
         let account = keychainAccount
         let proxyMode = mode == .proxy
@@ -1147,24 +1152,48 @@ final class VPNController: ObservableObject {
                 }
                 if !silent { try await BiometricGate.ensure() }
                 guard !Task.isCancelled else { return }
+                final class CancellationFlag: @unchecked Sendable {
+                    private let lock = NSLock()
+                    private var cancelled = false
+                    func markCancelled() { lock.lock(); cancelled = true; lock.unlock() }
+                    var isCancelled: Bool { lock.lock(); defer { lock.unlock() }; return cancelled }
+                }
+                let cancelFlag = CancellationFlag()
                 if proxyMode {
+                    if rootCleanupRequired {
+                        try await OpenConnectRunner.runBlocking {
+                            try OpenConnectRunner.cleanup()
+                        }
+                    }
+                    guard !Task.isCancelled else { return }
                     try await OpenConnectRunner.runBlocking {
-                        if rootCleanupRequired { try OpenConnectRunner.cleanup() }
                         try OpenConnectRunner.connectProxyMode(
-                            protocolName: p, server: s, user: u, password: pw, socksPort: socksPort
+                            protocolName: p,
+                            server: s,
+                            authGroup: g,
+                            user: u,
+                            password: pw,
+                            socksPort: socksPort
                         )
                     }
                 } else {
-                    try await OpenConnectRunner.runBlocking {
-                        try OpenConnectRunner.replaceConnection(
-                            protocolName: p,
-                            server: s,
-                            user: u,
-                            password: pw
-                        ) {
-                            Self.writeSplitConfFile(enabled: splitOn, cidrs: splitCIDRs)
-                            Self.writeDomainConfFile(enabled: splitOn, domains: domainSuffixes)
+                    try await withTaskCancellationHandler {
+                        try await OpenConnectRunner.runBlocking {
+                            try OpenConnectRunner.replaceConnection(
+                                protocolName: p,
+                                server: s,
+                                authGroup: g,
+                                user: u,
+                                password: pw
+                            ) {
+                                guard !cancelFlag.isCancelled else { throw CancellationError() }
+                                Self.writeSplitConfFile(enabled: splitOn, cidrs: splitCIDRs)
+                                Self.writeDomainConfFile(enabled: splitOn, domains: domainSuffixes)
+                            }
                         }
+                    } onCancel: {
+                        cancelFlag.markCancelled()
+                        OpenConnectRunner.cancelPendingConnection()
                     }
                 }
                 result = .success(())
@@ -1262,11 +1291,11 @@ final class VPNController: ObservableObject {
                 }
             }
             guard let self else { return }
-            self.isBusy = false
             self.isConnected = false
             self.activeMode = nil
             self.clearDiagnostics()
             self.statusText = errMsg ?? "未连接"
+            self.isBusy = false
         }
     }
 
@@ -1641,6 +1670,14 @@ final class VPNController: ObservableObject {
         // 睡眠场景由 shouldReconnectAfterWake 走另一条 reconnect 路径，
         // 取消掉这里 pollTick 触发的自动重连，避免两套机制打架
         cancelAutoReconnect()
+        // 休眠前先终止在途连接任务，防止随后异步回调污染状态或重新排重连。
+        if isConnecting || connectionTask != nil {
+            connectionAttemptID = nil
+            connectionTask?.cancel()
+            connectionTask = nil
+            isConnecting = false
+            isBusy = false
+        }
         shouldReconnectAfterWake = isConnected
         if isConnected { appLog(.warn, "休眠，断开连接") }
         let mode = activeMode ?? runningMode

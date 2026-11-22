@@ -159,6 +159,7 @@ func skipName(_ buf: UnsafePointer<UInt8>, length: Int, offset: Int) -> Int {
             return pos + 1
         }
         if b & 0xC0 == 0xC0 {
+            guard pos + 1 < length else { return -1 }
             return pos + 2
         }
         pos += Int(b) + 1
@@ -283,7 +284,8 @@ if let readyFile = config.readyFile {
     try? "\(getpid())\n".write(toFile: readyFile, atomically: true, encoding: .utf8)
 }
 
-let routeLock = NSLock()
+let routeCacheLock = NSLock()
+let routeInstallLock = NSLock()
 var routeOwnership = RouteOwnershipTracker<String>()
 let dnsPacketLimit = 4096
 var recvBuf = [UInt8](repeating: 0, count: dnsPacketLimit)
@@ -374,13 +376,27 @@ func handleQuery(query: [UInt8], clientAddr: sockaddr_in, clientLen: socklen_t) 
             extractARecordIPs(from: ptr.baseAddress!, length: responseLen)
         }
         if !ips.isEmpty {
-            routeLock.lock()
-            for ip in ips {
-                _ = routeOwnership.installIfNeeded(ip) {
-                    addRoute(host: ip, interface: config.utun)
+            // 快路径：大多数查询命中已缓存路由，仅短持 routeCacheLock，绝不被新 IP 的 route add 阻塞。
+            routeCacheLock.lock()
+            let missingIPs = ips.filter { !routeOwnership.ownedRoutes.contains($0) }
+            routeCacheLock.unlock()
+
+            if !missingIPs.isEmpty {
+                routeInstallLock.lock()
+                for ip in missingIPs {
+                    routeCacheLock.lock()
+                    let alreadyOwned = routeOwnership.ownedRoutes.contains(ip)
+                    routeCacheLock.unlock()
+                    if alreadyOwned { continue }
+
+                    if addRoute(host: ip, interface: config.utun) {
+                        routeCacheLock.lock()
+                        _ = routeOwnership.installIfNeeded(ip) { true }
+                        routeCacheLock.unlock()
+                    }
                 }
+                routeInstallLock.unlock()
             }
-            routeLock.unlock()
         }
         sendResponse(responseBuf, length: responseLen, to: clientAddr, clientLen: clientLen)
     } else {

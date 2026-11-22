@@ -1,4 +1,8 @@
 import AppKit
+import Darwin
+
+// 忽略 SIGPIPE：防止向已提前退出的子进程 stdin pipe 或断开的 socket 写入时终止进程。
+signal(SIGPIPE, SIG_IGN)
 
 let openMainWindowNotification = Notification.Name("com.kafeifei.xdvpn.openMainWindow")
 

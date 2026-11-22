@@ -62,11 +62,11 @@ final class WiFiSSIDReader: NSObject, CLLocationManagerDelegate, CWEventDelegate
         let ssid = ObservedWiFiSSID.normalized(iface.ssid())
         // 没有定位权限时 macOS 会脱敏 ssid()/bssid() 为 nil，但 powerOn() 与
         // wlanChannel()/interfaceMode() 仍能准确反映是否关联了 Wi-Fi。
+        // 注意：不能用 serviceActive()，它在 Wi-Fi 开启但未连任何热点时仍可能为 true。
         let associated = ssid != nil || (
             iface.powerOn() && (
                 iface.wlanChannel() != nil
-                || iface.interfaceMode() != .none
-                || iface.serviceActive()
+                || iface.interfaceMode() == .station
             )
         )
         return WiFiInterfaceSnapshot(ssid: ssid, isAssociatedToWiFi: associated)

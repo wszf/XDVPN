@@ -81,6 +81,17 @@ final class UIRefreshContractTests: XCTestCase {
         XCTAssertTrue(reader.contains("startMonitoringEvent(with: .ssidDidChange)"))
         XCTAssertTrue(reader.contains("process.standardError = FileHandle.nullDevice"))
         XCTAssertFalse(reader.contains("process.waitUntilExit()"))
+        XCTAssertFalse(reader.contains("iface.serviceActive()"))
+    }
+
+    func test_processStdinWriteIsProtectedAgainstSigpipeAndProxySeparatesServerArg() throws {
+        let main = try source("Sources/XDVPN/main.swift")
+        let runner = try source("Sources/XDVPN/OpenConnectRunner.swift")
+
+        XCTAssertTrue(main.contains("signal(SIGPIPE, SIG_IGN)"))
+        XCTAssertTrue(runner.contains("try? stdin.fileHandleForWriting.write(contentsOf:"))
+        XCTAssertFalse(runner.contains("stdin.fileHandleForWriting.write(Data("))
+        XCTAssertTrue(runner.contains("\"--\",\n            server,"))
     }
 
     func test_pollingRunsOnlyWhileConnectedAndUpdaterInvalidatesSession() throws {

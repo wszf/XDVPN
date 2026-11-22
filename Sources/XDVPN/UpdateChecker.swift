@@ -196,6 +196,8 @@ final class UpdateChecker: NSObject, ObservableObject, NSWindowDelegate {
                     let proc = Process()
                     proc.executableURL = URL(fileURLWithPath: "/usr/bin/ditto")
                     proc.arguments = ["-xk", zipURL.path, unzipDir.path]
+                    proc.standardOutput = FileHandle.nullDevice
+                    proc.standardError = FileHandle.nullDevice
                     try proc.run()
                     proc.waitUntilExit()
                     guard proc.terminationStatus == 0 else { throw UpdateError.unzipFailed }
@@ -208,7 +210,7 @@ final class UpdateChecker: NSObject, ObservableObject, NSWindowDelegate {
 
                     let script = """
                     #!/bin/bash
-                    for i in $(seq 1 75); do
+                    for i in $(seq 1 100); do
                         kill -0 \(pid) 2>/dev/null || break
                         sleep 0.2
                     done
