@@ -85,9 +85,16 @@ enum SudoersInstaller {
     }
 
     private static func helperHasSignature(_ path: String, signature: String) -> Bool {
-        guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
-              let content = String(data: data, encoding: .utf8) else { return false }
-        return content.hasPrefix(signature)
+        guard let handle = try? FileHandle(forReadingFrom: URL(fileURLWithPath: path)) else {
+            return false
+        }
+        defer { try? handle.close() }
+        let bytesToRead = max(signature.utf8.count, 128)
+        guard let data = try? handle.read(upToCount: bytesToRead),
+              let header = String(data: data, encoding: .utf8) else {
+            return false
+        }
+        return header.hasPrefix(signature)
     }
 
     private static var bundledOpenConnectDir: String? {

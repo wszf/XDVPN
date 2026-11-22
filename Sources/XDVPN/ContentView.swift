@@ -244,6 +244,7 @@ private struct ConnectionDurationText: NSViewRepresentable {
                 userInfo: nil,
                 repeats: true
             )
+            timer.tolerance = 0.2
             RunLoop.main.add(timer, forMode: .common)
             self.timer = timer
         }
@@ -788,14 +789,7 @@ private struct SplitTunnelSection: View {
     }
 
     private var subtitle: String {
-        let c = vpn.collectSplitCIDRs().count
-        let d = vpn.collectDomainSuffixes().count
-        if c == 0 && d == 0 { return "尚未选择任何规则" }
-        var parts: [String] = []
-        // 注：这里返回 String 而非 Text，Swift 字符串插值不会按 locale 千位分隔，所以安全
-        if c > 0 { parts.append("\(c) 个网段") }
-        if d > 0 { parts.append("\(d) 个域名") }
-        return parts.joined(separator: " · ") + " 走 VPN"
+        vpn.splitRuleSummary
     }
 }
 

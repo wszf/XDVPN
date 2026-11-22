@@ -43,17 +43,20 @@ extension EnvironmentValues {
 //   - 已连接：nil → 系统默认 label 色（亮菜单黑、暗菜单白）
 //   完全不再加任何品牌色。
 enum MenuBarIcon {
-    private static let cached: NSImage? = makeImage()
+    private static let cached: NSImage? = {
+        guard let img = makeImage() else { return nil }
+        img.isTemplate = true
+        return img
+    }()
 
-    static func template() -> NSImage {
-        if let img = cached?.copy() as? NSImage {
-            img.isTemplate = true
-            return img
-        }
-        // 兜底：SF Symbol（Icon.png 缺失的极端情况）
+    private static let fallbackSymbol: NSImage = {
         let sym = NSImage(systemSymbolName: "lock.shield", accessibilityDescription: "XDVPN") ?? NSImage()
         sym.isTemplate = true
         return sym
+    }()
+
+    static func template() -> NSImage {
+        cached ?? fallbackSymbol
     }
 
     private static func makeImage() -> NSImage? {
@@ -265,9 +268,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.refreshStatusItem() }
             .store(in: &cancellables)
 
-        // 流量在独立 monitor 中一次性发布。按最终显示文本去重，避免同一秒
-        // 上下行字段分别变化时重复合成图片，也避免数值变化但文本未变化时重画。
+        // 流量在独立 monitor 中一次性发布。先按外显开关过滤，未显示速度时跳过
+        // formatRate 格式化；按最终显示文本去重，避免同一秒重复合成图片。
         controller.trafficMonitor.$snapshot
+            .filter { [weak self] _ in
+                guard let self else { return false }
+                return self.controller.isConnected
+                    && self.controller.showSpeedInMenuBar
+                    && !self.controller.useProxyMode
+            }
             .map { snapshot in
                 StatusRateText(
                     down: VPNController.formatRate(snapshot.bytesInRate),
@@ -284,6 +293,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &cancellables)
     }
+
+    private static let statusRateTextAttrs: [NSAttributedString.Key: Any] = [
+        .font: NSFont.monospacedSystemFont(ofSize: 9, weight: .regular),
+        // template image：颜色用 .black，最终由系统按菜单栏明暗自动反色
+        .foregroundColor: NSColor.black,
+    ]
 
     private func refreshStatusItem() {
         guard let button = statusItem.button else { return }
@@ -319,12 +334,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let downStr = rates.down
         let upStr = rates.up
 
-        let font = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
-        // template image：颜色用 .black，最终由系统按菜单栏明暗自动反色
-        let textAttrs: [NSAttributedString.Key: Any] = [
-            .font: font,
-            .foregroundColor: NSColor.black,
-        ]
+        let textAttrs = Self.statusRateTextAttrs
         let downSize = (downStr as NSString).size(withAttributes: textAttrs)
         let upSize = (upStr as NSString).size(withAttributes: textAttrs)
         let textW = max(downSize.width, upSize.width)
@@ -409,6 +419,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
+        controller.isMainWindowVisible = true
         mainWindow?.makeKeyAndOrderFront(nil)
     }
 
@@ -419,7 +430,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         let proxyRunning = OpenConnectRunner.isProxyModeRunning
-        let kernelRunning = SudoersInstaller.isInstalled && OpenConnectRunner.isRunning
+        let kernelRunning = (controller?.sudoConfigured ?? SudoersInstaller.isInstalled)
+            && OpenConnectRunner.isRunning
 
         guard proxyRunning || kernelRunning else { return .terminateNow }
 
@@ -439,6 +451,7 @@ extension AppDelegate: NSWindowDelegate {
         guard let window = notification.object as? NSWindow, window === mainWindow else { return }
         // 断开 NSWindow -> NSHostingController -> SwiftUI 的完整观察链，同时触发
         // NSViewRepresentable.dismantleNSView，让时长 Timer 立即失效。
+        controller.isMainWindowVisible = false
         window.contentViewController = nil
         mainWindow = nil
 

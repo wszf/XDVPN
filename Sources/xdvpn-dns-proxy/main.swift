@@ -229,16 +229,7 @@ func createBoundListener() -> Int32 {
     return sock
 }
 
-func createUpstreamSocket(vpnDNS: String) -> (Int32, sockaddr_in) {
-    let sock = socket(AF_INET, SOCK_DGRAM, 0)
-    guard sock >= 0 else {
-        fputs("Failed to create upstream socket: \(String(cString: strerror(errno)))\n", stderr)
-        exit(1)
-    }
-
-    var tv = timeval(tv_sec: 5, tv_usec: 0)
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
-
+func parseUpstreamAddress(vpnDNS: String) -> sockaddr_in {
     var upstream = sockaddr_in()
     upstream.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
     upstream.sin_family = sa_family_t(AF_INET)
@@ -246,21 +237,29 @@ func createUpstreamSocket(vpnDNS: String) -> (Int32, sockaddr_in) {
     let parsed = vpnDNS.withCString { inet_pton(AF_INET, $0, &upstream.sin_addr) }
     guard parsed == 1 else {
         fputs("Invalid upstream DNS address: \(vpnDNS)\n", stderr)
-        close(sock)
         exit(1)
     }
-    let connected = withUnsafePointer(to: &upstream) { ptr in
+    return upstream
+}
+
+func openConnectedUpstreamSocket(to upstream: sockaddr_in) -> Int32 {
+    let sock = socket(AF_INET, SOCK_DGRAM, 0)
+    guard sock >= 0 else { return -1 }
+
+    var tv = timeval(tv_sec: 2, tv_usec: 0)
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+
+    var addr = upstream
+    let connected = withUnsafePointer(to: &addr) { ptr in
         ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) {
             connect(sock, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
         }
     }
     guard connected == 0 else {
-        fputs("Failed to connect upstream DNS socket: \(String(cString: strerror(errno)))\n", stderr)
         close(sock)
-        exit(1)
+        return -1
     }
-
-    return (sock, upstream)
+    return sock
 }
 
 // MARK: - Main
@@ -274,7 +273,7 @@ guard !suffixes.isEmpty else {
 }
 
 let listenerSock = createBoundListener()
-let (upstreamSock, upstreamAddr) = createUpstreamSocket(vpnDNS: config.vpnDNS)
+let upstreamAddr = parseUpstreamAddress(vpnDNS: config.vpnDNS)
 
 // Resolver files must be created AFTER binding port 53, otherwise macOS
 // routes queries to 127.0.0.1:53 before anything is listening — the
@@ -284,8 +283,14 @@ if let readyFile = config.readyFile {
     try? "\(getpid())\n".write(toFile: readyFile, atomically: true, encoding: .utf8)
 }
 
+let routeLock = NSLock()
 var routeOwnership = RouteOwnershipTracker<String>()
-var recvBuf = [UInt8](repeating: 0, count: 65535)
+let dnsPacketLimit = 4096
+var recvBuf = [UInt8](repeating: 0, count: dnsPacketLimit)
+
+// 有界并发转发队列：单次上游超时不再阻塞其他并发 DNS 查询（消除队头阻塞）。
+let queryQueue = DispatchQueue(label: "com.kafeifei.xdvpn.dns.worker", qos: .userInitiated, attributes: .concurrent)
+let concurrencyLimit = DispatchSemaphore(value: 32)
 
 // 心跳：用独立 socket 每 30s 往 VPN DNS 发一个 dummy DNS 查询，
 // 产生隧道 UDP 流量防止服务端 idle timeout。
@@ -297,8 +302,12 @@ var keepaliveQuery: [UInt8] = [
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x01, 0x00, 0x01,  // query "." A IN
 ]
+var keepaliveDrainBuf = [UInt8](repeating: 0, count: 512)
 
 func sendKeepalive() {
+    guard keepaliveSock >= 0 else { return }
+    // 非阻塞排空上一次 keepalive 回包，防止内核接收缓冲积压。
+    while recv(keepaliveSock, &keepaliveDrainBuf, keepaliveDrainBuf.count, MSG_DONTWAIT) > 0 {}
     var dst = upstreamAddr
     withUnsafePointer(to: &dst) { p in
         p.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -308,14 +317,84 @@ func sendKeepalive() {
     }
 }
 
+@Sendable
+func sendResponse(_ bytes: [UInt8], length: Int, to clientAddr: sockaddr_in, clientLen: socklen_t) {
+    var addr = clientAddr
+    bytes.withUnsafeBufferPointer { buf in
+        guard let base = buf.baseAddress else { return }
+        withUnsafeMutablePointer(to: &addr) { ptr in
+            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                _ = sendto(listenerSock, base, length, 0, sa, clientLen)
+            }
+        }
+    }
+}
+
+@Sendable
+func sendServfail(for query: [UInt8], to clientAddr: sockaddr_in, clientLen: socklen_t) {
+    let servfail = query.withUnsafeBufferPointer { ptr -> [UInt8] in
+        guard let base = ptr.baseAddress else { return [] }
+        return buildServfail(from: base, queryLen: query.count)
+    }
+    guard !servfail.isEmpty else { return }
+    sendResponse(servfail, length: servfail.count, to: clientAddr, clientLen: clientLen)
+}
+
+@Sendable
+func handleQuery(query: [UInt8], clientAddr: sockaddr_in, clientLen: socklen_t) {
+    let upstreamSock = openConnectedUpstreamSocket(to: upstreamAddr)
+    guard upstreamSock >= 0 else {
+        sendServfail(for: query, to: clientAddr, clientLen: clientLen)
+        return
+    }
+    defer { close(upstreamSock) }
+
+    let sendLen = query.withUnsafeBufferPointer { ptr -> Int in
+        guard let base = ptr.baseAddress else { return -1 }
+        return send(upstreamSock, base, query.count, 0)
+    }
+
+    var responseBuf = [UInt8](repeating: 0, count: dnsPacketLimit)
+    var responseLen: Int = -1
+
+    if sendLen == query.count {
+        // The connected UDP socket accepts responses only from the configured DNS peer.
+        // Ignore stale or spoofed packets and accept only a response to this query.
+        for _ in 0..<4 {
+            responseLen = recv(upstreamSock, &responseBuf, responseBuf.count, 0)
+            if responseLen <= 0 { break }
+            let response = Array(responseBuf.prefix(responseLen))
+            if DNSResponseMatcher.matches(query: query, response: response) { break }
+            responseLen = -1
+        }
+    }
+
+    if responseLen > 0 {
+        let ips = responseBuf.withUnsafeBufferPointer { ptr in
+            extractARecordIPs(from: ptr.baseAddress!, length: responseLen)
+        }
+        if !ips.isEmpty {
+            routeLock.lock()
+            for ip in ips {
+                _ = routeOwnership.installIfNeeded(ip) {
+                    addRoute(host: ip, interface: config.utun)
+                }
+            }
+            routeLock.unlock()
+        }
+        sendResponse(responseBuf, length: responseLen, to: clientAddr, clientLen: clientLen)
+    } else {
+        sendServfail(for: query, to: clientAddr, clientLen: clientLen)
+    }
+}
+
 func cleanup() {
     deleteResolverFiles(for: suffixes)
     if let readyFile = config.readyFile {
         try? FileManager.default.removeItem(atPath: readyFile)
     }
     close(listenerSock)
-    close(upstreamSock)
-    close(keepaliveSock)
+    if keepaliveSock >= 0 { close(keepaliveSock) }
 }
 
 // Main loop
@@ -337,50 +416,18 @@ while terminated == 0 {
         }
         guard queryLen > 0 else { continue }
 
-        // The connected UDP socket accepts responses only from the configured DNS peer.
         let query = Array(recvBuf.prefix(queryLen))
-        let sendLen = send(upstreamSock, &recvBuf, queryLen, 0)
+        let addrCopy = clientAddr
+        let lenCopy = clientLen
 
-        var responseBuf = [UInt8](repeating: 0, count: 65535)
-        var responseLen: Int = -1
-
-        if sendLen == queryLen {
-            // Ignore stale or spoofed packets and accept only a response to this query.
-            for _ in 0..<8 {
-                responseLen = recv(upstreamSock, &responseBuf, responseBuf.count, 0)
-                if responseLen <= 0 { break }
-                let response = Array(responseBuf.prefix(responseLen))
-                if DNSResponseMatcher.matches(query: query, response: response) { break }
-                responseLen = -1
-            }
-        }
-
-        if responseLen > 0 {
-            let ips = responseBuf.withUnsafeBufferPointer { ptr in
-                extractARecordIPs(from: ptr.baseAddress!, length: responseLen)
-            }
-            for ip in ips {
-                _ = routeOwnership.installIfNeeded(ip) {
-                    addRoute(host: ip, interface: config.utun)
-                }
-            }
-
-            withUnsafeMutablePointer(to: &clientAddr) { ptr in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    _ = sendto(listenerSock, &responseBuf, responseLen, 0, sa, clientLen)
-                }
+        if concurrencyLimit.wait(timeout: .now()) == .success {
+            queryQueue.async {
+                defer { concurrencyLimit.signal() }
+                handleQuery(query: query, clientAddr: addrCopy, clientLen: lenCopy)
             }
         } else {
-            var servfail = recvBuf.withUnsafeBufferPointer { ptr in
-                buildServfail(from: ptr.baseAddress!, queryLen: queryLen)
-            }
-            guard !servfail.isEmpty else { continue }
-
-            withUnsafeMutablePointer(to: &clientAddr) { ptr in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    _ = sendto(listenerSock, &servfail, servfail.count, 0, sa, clientLen)
-                }
-            }
+            // 超出并发上限时直接回 SERVFAIL，避免无限积压内存或耗尽 fd。
+            sendServfail(for: query, to: addrCopy, clientLen: lenCopy)
         }
     } else if pollResult == 0 {
         if !utunExists(config.utun) {

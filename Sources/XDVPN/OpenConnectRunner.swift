@@ -1,6 +1,24 @@
 import Foundation
 import XDVPNCore
 
+private final class LockedDataBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var data = Data()
+
+    func set(_ value: Data) {
+        lock.lock()
+        data = value
+        lock.unlock()
+    }
+
+    func get() -> Data {
+        lock.lock()
+        let snapshot = data
+        lock.unlock()
+        return snapshot
+    }
+}
+
 private final class PendingConnectionProcess: @unchecked Sendable {
     private let lock = NSLock()
     private var pid: pid_t?
@@ -60,8 +78,39 @@ enum OpenConnectRunner {
     private static let pendingConnection = PendingConnectionProcess()
     private static let rootTunnelOperationGate = ExclusiveOperationGate()
     private static let connectionTimeout: TimeInterval = 30
+    /// 专用阻塞队列，避免把长时间的 Process 等待与 NSLock 压到有限的 Swift Cooperative Thread Pool。
+    private static let blockingQueue = DispatchQueue(
+        label: "com.kafeifei.xdvpn.runner.blocking",
+        qos: .userInitiated,
+        attributes: .concurrent
+    )
 
     static let protocols = ["anyconnect", "nc", "gp", "pulse", "f5", "fortinet", "array"]
+
+    /// 在专用阻塞队列执行同步子进程 / 锁操作，不占用 Swift 并发协作线程池。
+    static func runBlocking<T: Sendable>(
+        _ operation: @escaping @Sendable () throws -> T
+    ) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            blockingQueue.async {
+                do {
+                    continuation.resume(returning: try operation())
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    static func runBlocking<T: Sendable>(
+        _ operation: @escaping @Sendable () -> T
+    ) async -> T {
+        await withCheckedContinuation { continuation in
+            blockingQueue.async {
+                continuation.resume(returning: operation())
+            }
+        }
+    }
 
     // MARK: - Connect
 
@@ -132,8 +181,14 @@ enum OpenConnectRunner {
         let stdin = Pipe()
         let stderr = Pipe()
         proc.standardInput = stdin
+        proc.standardOutput = FileHandle.nullDevice
         proc.standardError = stderr
         // 不接 stdout —— openconnect 自己写 syslog，我们不需要另一份 log 文件
+
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in
+            exitSemaphore.signal()
+        }
 
         do {
             try proc.run()
@@ -143,10 +198,15 @@ enum OpenConnectRunner {
         pendingConnection.register(proc.processIdentifier)
         defer { pendingConnection.clear(proc.processIdentifier) }
 
+        let stderrDrain = startDraining(pipe: stderr)
         stdin.fileHandleForWriting.write(Data((password + "\n").utf8))
         try? stdin.fileHandleForWriting.close()
 
-        let failure = try waitForConnectionProcess(proc, stderr: stderr)
+        let failure = try waitForConnectionProcess(
+            proc,
+            exitSemaphore: exitSemaphore,
+            stderrDrain: stderrDrain
+        )
         if failure.contains("a password is required")
             || failure.contains("sudo:")
             || failure.contains("no tty present")
@@ -172,15 +232,21 @@ enum OpenConnectRunner {
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
         proc.arguments = ["-n", SudoersInstaller.cleanupPath]
         let errPipe = Pipe()
+        proc.standardOutput = FileHandle.nullDevice
         proc.standardError = errPipe
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in
+            exitSemaphore.signal()
+        }
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch {
             throw VPNError.cleanupFailed(error.localizedDescription)
         }
+        let errDrain = startDraining(pipe: errPipe)
+        exitSemaphore.wait()
+        let errData = errDrain.finish()
         if proc.terminationStatus != 0 {
-            let errData = errPipe.fileHandleForReading.readDataToEndOfFile()
             let msg =
                 String(data: errData, encoding: .utf8)?
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -267,7 +333,13 @@ enum OpenConnectRunner {
         let stdin = Pipe()
         let stderr = Pipe()
         proc.standardInput = stdin
+        proc.standardOutput = FileHandle.nullDevice
         proc.standardError = stderr
+
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in
+            exitSemaphore.signal()
+        }
 
         do {
             try proc.run()
@@ -277,10 +349,15 @@ enum OpenConnectRunner {
         pendingConnection.register(proc.processIdentifier)
         defer { pendingConnection.clear(proc.processIdentifier) }
 
+        let stderrDrain = startDraining(pipe: stderr)
         stdin.fileHandleForWriting.write(Data((password + "\n").utf8))
         try? stdin.fileHandleForWriting.close()
 
-        let failure = try waitForConnectionProcess(proc, stderr: stderr)
+        let failure = try waitForConnectionProcess(
+            proc,
+            exitSemaphore: exitSemaphore,
+            stderrDrain: stderrDrain
+        )
         if !failure.isEmpty { throw VPNError.connectFailed(failure) }
     }
 
@@ -288,26 +365,51 @@ enum OpenConnectRunner {
         pendingConnection.cancel()
     }
 
+    private struct PipeDrain {
+        let group: DispatchGroup
+        let buffer: LockedDataBuffer
+        let handle: FileHandle
+
+        func finish(timeout: TimeInterval = 1.0) -> Data {
+            _ = group.wait(timeout: .now() + timeout)
+            return buffer.get()
+        }
+
+        func abort() {
+            try? handle.close()
+            _ = group.wait(timeout: .now() + 0.5)
+        }
+    }
+
+    private static func startDraining(pipe: Pipe) -> PipeDrain {
+        let group = DispatchGroup()
+        let buffer = LockedDataBuffer()
+        let readHandle = pipe.fileHandleForReading
+        group.enter()
+        blockingQueue.async {
+            buffer.set(readHandle.readDataToEndOfFile())
+            group.leave()
+        }
+        return PipeDrain(group: group, buffer: buffer, handle: readHandle)
+    }
+
     /// `--background` returns only after authentication and tunnel setup. Bound
     /// that foreground phase so a stale HTTPS socket cannot keep the UI busy forever.
     private static func waitForConnectionProcess(
         _ proc: Process,
-        stderr: Pipe,
+        exitSemaphore: DispatchSemaphore,
+        stderrDrain: PipeDrain,
         timeout: TimeInterval = connectionTimeout
     ) throws -> String {
-        let deadline = Date().addingTimeInterval(timeout)
-        while proc.isRunning, Date() < deadline {
-            Thread.sleep(forTimeInterval: 0.1)
-        }
-
-        if proc.isRunning {
+        if exitSemaphore.wait(timeout: .now() + timeout) == .timedOut {
             killAndWait(proc.processIdentifier)
-            proc.waitUntilExit()
+            _ = exitSemaphore.wait(timeout: .now() + 2)
+            stderrDrain.abort()
             throw VPNError.connectFailed("连接服务器超时（\(Int(timeout)) 秒）")
         }
 
+        let errData = stderrDrain.finish()
         guard proc.terminationStatus != 0 else { return "" }
-        let errData = stderr.fileHandleForReading.readDataToEndOfFile()
         let message = String(data: errData, encoding: .utf8)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return message.isEmpty ? "exit \(proc.terminationStatus)" : message
@@ -342,9 +444,12 @@ enum OpenConnectRunner {
 
     private static func killAndWait(_ pid: pid_t) {
         kill(pid, SIGTERM)
-        for _ in 0..<20 {  // 最多 2s
-            if kill(pid, 0) != 0 { break }
-            usleep(100_000)
+        let deadline = Date().addingTimeInterval(2.0)
+        var stepUsec: useconds_t = 20_000
+        while Date() < deadline {
+            if kill(pid, 0) != 0 { return }
+            usleep(stepUsec)
+            stepUsec = min(stepUsec + 15_000, 100_000)
         }
         if kill(pid, 0) == 0 { kill(pid, SIGKILL) }
     }
@@ -357,12 +462,22 @@ enum OpenConnectRunner {
         let out = Pipe()
         proc.standardOutput = out
         proc.standardError = FileHandle.nullDevice
+        let exitSemaphore = DispatchSemaphore(value: 0)
+        proc.terminationHandler = { _ in
+            exitSemaphore.signal()
+        }
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch { return [] }
 
-        let data = out.fileHandleForReading.readDataToEndOfFile()
+        let outDrain = startDraining(pipe: out)
+        if exitSemaphore.wait(timeout: .now() + 3) == .timedOut {
+            proc.terminate()
+            outDrain.abort()
+            return []
+        }
+
+        let data = outDrain.finish()
         return (String(data: data, encoding: .utf8) ?? "")
             .split(separator: "\n")
             .compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }

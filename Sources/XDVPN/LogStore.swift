@@ -70,10 +70,15 @@ final class LogStore: ObservableObject {
         entries.removeAll()
     }
 
-    /// 纯文本导出（复制全部用）。每行 `HH:mm:ss 级别 message`。
-    func plainText() -> String {
+    private static let exportFormatter: DateFormatter = {
         let fmt = DateFormatter()
         fmt.dateFormat = "HH:mm:ss"
+        return fmt
+    }()
+
+    /// 纯文本导出（复制全部用）。每行 `HH:mm:ss 级别 message`。
+    func plainText() -> String {
+        let fmt = Self.exportFormatter
         return entries.map { e in
             "\(fmt.string(from: e.time)) \(e.level.label) \(e.message)"
         }.joined(separator: "\n")

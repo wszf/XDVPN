@@ -4,7 +4,7 @@ import SwiftUI
 import XDVPNCore
 
 @MainActor
-final class UpdateChecker: ObservableObject {
+final class UpdateChecker: NSObject, ObservableObject, NSWindowDelegate {
     @Published private(set) var latestVersion: String?
     @Published private(set) var downloadURL: URL?
     @Published private(set) var releaseNotes: String?
@@ -23,23 +23,42 @@ final class UpdateChecker: ObservableObject {
     private var updateWindow: NSWindow?
     private var releaseNotesWindow: NSWindow?
     private var pollTimer: Timer?
+    private var lastReleaseETag: String?
 
-    func startPolling(interval: TimeInterval = 600) {
+    func startPolling(interval: TimeInterval = 14_400) {
         check()
         pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in self.check() }
+        let timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in self?.check() }
         }
+        timer.tolerance = min(300, interval * 0.1)
+        pollTimer = timer
     }
 
     func check() {
         let url = URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!
         var req = URLRequest(url: url)
         req.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        if let etag = lastReleaseETag {
+            req.setValue(etag, forHTTPHeaderField: "If-None-Match")
+        }
         req.timeoutInterval = 10
 
-        URLSession.shared.dataTask(with: req) { [weak self] data, _, _ in
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
+            if let http = response as? HTTPURLResponse {
+                if http.statusCode == 304 { return }
+                let newETag = http.value(forHTTPHeaderField: "ETag")
+                guard (200...299).contains(http.statusCode),
+                      let data,
+                      let release = GitHubReleaseMetadata.parse(data) else { return }
+                Task { @MainActor [weak self] in
+                    if let newETag { self?.lastReleaseETag = newETag }
+                    self?.latestVersion = release.version
+                    self?.downloadURL = release.downloadURL
+                    self?.releaseNotes = release.notes
+                }
+                return
+            }
             guard let data,
                   let release = GitHubReleaseMetadata.parse(data) else { return }
 
@@ -82,6 +101,7 @@ final class UpdateChecker: ObservableObject {
         window.styleMask = [.titled, .closable]
         window.level = .floating
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -105,10 +125,22 @@ final class UpdateChecker: ObservableObject {
         window.styleMask = [.titled, .closable]
         window.level = .floating
         window.isReleasedWhenClosed = false
+        window.delegate = self
         window.center()
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         releaseNotesWindow = window
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow else { return }
+        if window === updateWindow {
+            window.contentViewController = nil
+            updateWindow = nil
+        } else if window === releaseNotesWindow {
+            window.contentViewController = nil
+            releaseNotesWindow = nil
+        }
     }
 
     func showCurrentReleaseNotesIfNeeded() {
@@ -126,14 +158,19 @@ final class UpdateChecker: ObservableObject {
         statusText = "下载中…"
 
         let delegate = DownloadDelegate { [weak self] progress in
-            Task { @MainActor in self?.downloadProgress = progress }
+            Task { @MainActor [weak self] in self?.downloadProgress = progress }
         } completion: { [weak self] result in
-            Task { @MainActor in self?.handleDownloadResult(result) }
+            Task { @MainActor [weak self] in
+                self?.downloadDelegate = nil
+                self?.handleDownloadResult(result)
+            }
         }
         downloadDelegate = delegate
 
         let session = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
         session.downloadTask(with: downloadURL).resume()
+        // 任务完成或失败后自动销毁 session，避免 URLSession 强引用 delegate 造成泄漏。
+        session.finishTasksAndInvalidate()
     }
 
     private func handleDownloadResult(_ result: Result<URL, Error>) {
@@ -199,7 +236,7 @@ final class UpdateChecker: ObservableObject {
                         runner.standardError = FileHandle.nullDevice
                         try? runner.run()
 
-                        exit(0)
+                        NSApp.terminate(nil)
                     }
                 } catch {
                     let s = self
@@ -345,11 +382,14 @@ private struct CurrentReleaseNotesView: View {
     }
 }
 
-private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate {
-    let onProgress: (Double) -> Void
-    let onComplete: (Result<URL, Error>) -> Void
+private final class DownloadDelegate: NSObject, URLSessionDownloadDelegate, Sendable {
+    let onProgress: @Sendable (Double) -> Void
+    let onComplete: @Sendable (Result<URL, Error>) -> Void
 
-    init(onProgress: @escaping (Double) -> Void, completion: @escaping (Result<URL, Error>) -> Void) {
+    init(
+        onProgress: @escaping @Sendable (Double) -> Void,
+        completion: @escaping @Sendable (Result<URL, Error>) -> Void
+    ) {
         self.onProgress = onProgress
         self.onComplete = completion
     }

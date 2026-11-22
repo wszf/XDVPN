@@ -74,6 +74,26 @@ final class UIRefreshContractTests: XCTestCase {
         XCTAssertTrue(controller.contains("await startupCleanupTask.value"))
     }
 
+    func test_wifiReaderSubscribesToCoreWLANEventsAndDrainsPipeWithoutDeadlock() throws {
+        let reader = try source("Sources/XDVPN/WiFiSSIDReader.swift")
+
+        XCTAssertTrue(reader.contains("CWEventDelegate"))
+        XCTAssertTrue(reader.contains("startMonitoringEvent(with: .ssidDidChange)"))
+        XCTAssertTrue(reader.contains("process.standardError = FileHandle.nullDevice"))
+        XCTAssertFalse(reader.contains("process.waitUntilExit()"))
+    }
+
+    func test_pollingRunsOnlyWhileConnectedAndUpdaterInvalidatesSession() throws {
+        let controller = try source("Sources/XDVPN/VPNController.swift")
+        let updater = try source("Sources/XDVPN/UpdateChecker.swift")
+
+        XCTAssertTrue(controller.contains("stopPolling()"))
+        XCTAssertTrue(controller.contains("timer.tolerance ="))
+        XCTAssertTrue(updater.contains("session.finishTasksAndInvalidate()"))
+        XCTAssertTrue(updater.contains("window.contentViewController = nil"))
+        XCTAssertTrue(updater.contains("If-None-Match"))
+    }
+
     private func source(_ relativePath: String) throws -> String {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()

@@ -67,10 +67,13 @@ final class VPNController: ObservableObject {
             UserDefaults.standard.set(wifiOnDemandEnabled, forKey: "xdvpn.wifiOnDemand.enabled")
             guard !isLoadingPrefs else { return }
             if wifiOnDemandEnabled {
+                suppressedAutoConnectSSID = nil
                 _ = refreshCurrentWiFiSSID()
-                _ = applyWiFiOnDemandPolicy(trigger: "启用 Wi-Fi 按需连接")
+                _ = applyWiFiOnDemandPolicy(trigger: "启用 Wi-Fi 按需连接", respectManualSuppression: false)
             } else {
                 pausedByWiFiPolicy = false
+                pendingWiFiPolicyReevaluation = false
+                suppressedAutoConnectSSID = nil
                 wifiOnDemandStatusText = "未启用"
             }
         }
@@ -84,27 +87,50 @@ final class VPNController: ObservableObject {
     @Published private(set) var wifiSSIDLocationPermissionRequired: Bool = false
 
     // MARK: - 分流（Split Tunnel）—— 仅在 runningMode == .split 时生效
-    @Published var splitPreset10: Bool = true      // 10.0.0.0/8
-    @Published var splitPreset172: Bool = true     // 172.16.0.0/12
-    @Published var splitPreset192: Bool = false    // 192.168.0.0/16（通常是本地 LAN）
+    @Published var splitPreset10: Bool = true {      // 10.0.0.0/8
+        didSet { updateSplitRuleSummaryIfNeeded() }
+    }
+    @Published var splitPreset172: Bool = true {     // 172.16.0.0/12
+        didSet { updateSplitRuleSummaryIfNeeded() }
+    }
+    @Published var splitPreset192: Bool = false {    // 192.168.0.0/16（通常是本地 LAN）
+        didSet { updateSplitRuleSummaryIfNeeded() }
+    }
     /// 自定义 CIDR，多行/逗号分隔
-    @Published var splitCustom: String = ""
+    @Published var splitCustom: String = "" {
+        didSet { updateSplitRuleSummaryIfNeeded() }
+    }
     /// 域名分流后缀列表，一行一个（如 xindong.com），匹配该域名及所有子域名
-    @Published var splitDomains: String = ""
+    @Published var splitDomains: String = "" {
+        didSet { updateSplitRuleSummaryIfNeeded() }
+    }
+    /// 缓存的分流摘要，避免主窗口其他字段变化时重复解析 CIDR/域名列表。
+    private(set) var splitRuleSummary: String = "2 个网段 走 VPN"
 
     // MARK: - 状态
 
     @Published private(set) var isConnected: Bool = false {
         didSet {
-            // 任何路径让 VPN 断开（手动 / 休眠 / 异常死亡 / 唤醒重连前清理）
-            // 都把 SOCKS5 server 同步关掉 —— 它绑的 utun 接口已经无效
-            if !isConnected, oldValue {
-                socks5.stop()
-                socks5Active = false
+            if isConnected {
+                startPolling()
+            } else {
+                stopPolling()
+                if oldValue {
+                    socks5Active = false
+                }
             }
         }
     }
-    @Published private(set) var isBusy: Bool = false
+    @Published private(set) var isBusy: Bool = false {
+        didSet {
+            if oldValue, !isBusy, pendingWiFiPolicyReevaluation {
+                pendingWiFiPolicyReevaluation = false
+                Task { @MainActor [weak self] in
+                    self?.flushPendingWiFiPolicyIfNeeded()
+                }
+            }
+        }
+    }
     @Published private(set) var isConnecting: Bool = false
     @Published private(set) var statusText: String = "未连接"
     @Published private(set) var sudoConfigured: Bool = SudoersInstaller.isInstalled
@@ -191,12 +217,31 @@ final class VPNController: ObservableObject {
     @Published private(set) var socks5Active: Bool = false
     @Published private(set) var socks5Error: String?
 
-    private let socks5 = Socks5Proxy()
+    /// 主窗口当前是否可见：窗口关闭且未在状态栏外显速度时，可降低非 full 模式的流量采集频率。
+    var isMainWindowVisible: Bool = false
 
     // MARK: - 私有
 
+    private struct SessionFileStamp: Equatable, Sendable {
+        let mtimeSec: Int
+        let mtimeNsec: Int
+        let size: off_t
+        let inode: UInt64
+    }
+
+    private struct PollSample: Sendable {
+        let processAlive: Bool
+        let session: RouteScriptSession?
+        let sessionStamp: SessionFileStamp?
+        let tunnelInfo: TunnelInfo?
+    }
+
     private var lastTrafficSample: (inBytes: UInt64, outBytes: UInt64, at: Date)?
     private var pollTimer: Timer?
+    private let pollQueue = DispatchQueue(label: "com.kafeifei.xdvpn.poll", qos: .utility)
+    private var pollInFlight = false
+    private var pollTickCount: UInt64 = 0
+    private var cachedSessionStamp: SessionFileStamp?
     private var connectionTask: Task<Void, Never>?
     private var connectionAttemptID: UUID?
     private var startupCleanupTask: Task<String?, Never>?
@@ -208,15 +253,23 @@ final class VPNController: ObservableObject {
     /// 区分本次 connect 是自动重连发起（失败要推进退避）还是用户手动（失败就停）
     private var isAutoReconnecting = false
 
-    // 网络可达性：NWPathMonitor 驱动，供「等网就绪再重连」门控与换网检测
+    // 网络可达性：NWPathMonitor + CoreWLAN 驱动，供「等网就绪再重连」门控与换网/Wi-Fi 检测
     private let pathMonitor = NetworkPathMonitor()
     private var networkSatisfied = true
+    private var networkUsesWiFi = true
+    private var hasPathSnapshot = false
     private var changeDetector = NetworkChangeDetector()
     private let wifiSSIDReader = WiFiSSIDReader()
+    private var wifiAssociated = false
     private var lastObservedSSID: String?
     private var hasObservedSSID = false
     private var wifiSSIDFallbackInFlight = false
+    private var wifiSSIDFallbackTask: Task<Void, Never>?
     private var lastWiFiSSIDFallbackStartedAt: Date?
+    /// 当 Wi-Fi 规则触发时恰逢 isBusy（例如正在断开/切换），标记延后到 isBusy 结束后补评估。
+    private var pendingWiFiPolicyReevaluation = false
+    /// 用户在该 SSID 下手动点过「断开」：离开该 SSID 或手动连接前，不再被同一 SSID 的自动连接规则拉回。
+    private var suppressedAutoConnectSSID: String?
 
     // 黑洞检测（full 模式）：跟踪入站字节是否长期停滞
     private var lastInboundBytes: UInt64 = 0
@@ -245,12 +298,22 @@ final class VPNController: ObservableObject {
 
     init() {
         loadPrefs()
+        updateSplitRuleSummaryIfNeeded()
         wifiSSIDReader.onAuthorizationChanged = { [weak self] in
             guard let self else { return }
             self.updateWiFiSSIDLocationPermissionState()
             let changed = self.refreshCurrentWiFiSSID()
             if changed || self.wifiOnDemandEnabled {
                 _ = self.applyWiFiOnDemandPolicy(trigger: "Wi-Fi 权限变更")
+            }
+        }
+        wifiSSIDReader.onWiFiChanged = { [weak self] in
+            guard let self else { return }
+            let changed = self.refreshCurrentWiFiSSID(fallbackMinInterval: 4)
+            if changed {
+                self.handleNetworkChanged()
+            } else if self.wifiOnDemandEnabled {
+                _ = self.applyWiFiOnDemandPolicy(trigger: "Wi-Fi 状态变化")
             }
         }
         updateWiFiSSIDLocationPermissionState()
@@ -265,9 +328,11 @@ final class VPNController: ObservableObject {
         //   - 纯代理模式：/tmp/xdvpn-proxy.pid 指的 openconnect (用户身份) + 它的 ocproxy 子进程
         // 这两套必须分开清，否则上一次 GUI 被 kill 后留下的孤儿 VPN 会让新 GUI 显示"未连接"
         // 但底层 SOCKS5 仍能用的诡异状态
-        Task.detached {
-            // 用户态的（无需 sudo），永远跑
-            OpenConnectRunner.disconnectProxyMode()
+        Task {
+            // 用户态的（无需 sudo），放到专用阻塞队列避免占用协作线程池
+            await OpenConnectRunner.runBlocking {
+                OpenConnectRunner.disconnectProxyMode()
+            }
         }
         // root 那套需要 sudoers 已配 —— 首次启动时 cleanup helper 还不存在，跳过
         if sudoConfigured {
@@ -278,7 +343,6 @@ final class VPNController: ObservableObject {
                 self?.startupCleanupTask = nil
             }
         }
-        startPolling()
         registerSleepHook()
         startPathMonitor()
     }
@@ -286,6 +350,7 @@ final class VPNController: ObservableObject {
     deinit {
         pollTimer?.invalidate()
         autoReconnectTimer?.invalidate()
+        wifiSSIDFallbackTask?.cancel()
         pathMonitor.cancel()
         let nc = NSWorkspace.shared.notificationCenter
         if let obs = sleepObserver { nc.removeObserver(obs) }
@@ -295,17 +360,23 @@ final class VPNController: ObservableObject {
     // MARK: - 网络路径监听（换网 / 等网就绪）
 
     private func startPathMonitor() {
-        pathMonitor.onUpdate = { [weak self] satisfied, names in
+        pathMonitor.onUpdate = { [weak self] snapshot in
             // 回调在后台 queue，切回 MainActor 再读写状态
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.networkSatisfied = satisfied
+                let previousUsesWiFi = self.networkUsesWiFi
+                let hadSnapshot = self.hasPathSnapshot
+                self.hasPathSnapshot = true
+                self.networkSatisfied = snapshot.isSatisfied
+                self.networkUsesWiFi = snapshot.usesWiFi
+
                 let changed = self.changeDetector.observe(
-                    fingerprint: physicalInterfaceFingerprint(names))
+                    fingerprint: physicalInterfaceFingerprint(snapshot.interfaceNames))
+                let wifiTransportChanged = hadSnapshot && (previousUsesWiFi != snapshot.usesWiFi)
                 let ssidChanged = self.refreshCurrentWiFiSSID(
-                    fallbackMinInterval: changed ? 8 : 30
+                    fallbackMinInterval: (changed || wifiTransportChanged) ? 8 : 30
                 )
-                if changed || ssidChanged {
+                if changed || ssidChanged || wifiTransportChanged {
                     self.handleNetworkChanged()
                 }
             }
@@ -332,15 +403,15 @@ final class VPNController: ObservableObject {
         isBusy = true
         let mode = activeMode ?? runningMode
         if mode == .proxy {
-            Task.detached { [weak self] in
-                OpenConnectRunner.disconnectProxyMode()
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    self.isConnected = false
-                    self.activeMode = nil
-                    self.isBusy = false
-                    self.onTunnelLost()
+            Task { [weak self] in
+                await OpenConnectRunner.runBlocking {
+                    OpenConnectRunner.disconnectProxyMode()
                 }
+                guard let self else { return }
+                self.isConnected = false
+                self.activeMode = nil
+                self.isBusy = false
+                self.onTunnelLost()
             }
         } else {
             runCleanupDetached(reason: "换网清理旧隧道") { [weak self] in
@@ -454,6 +525,23 @@ final class VPNController: ObservableObject {
         DomainRules.parseSuffixList(splitDomains)
     }
 
+    private func updateSplitRuleSummaryIfNeeded() {
+        let c = collectSplitCIDRs().count
+        let d = collectDomainSuffixes().count
+        let next: String
+        if c == 0 && d == 0 {
+            next = "尚未选择任何规则"
+        } else {
+            var parts: [String] = []
+            if c > 0 { parts.append("\(c) 个网段") }
+            if d > 0 { parts.append("\(d) 个域名") }
+            next = parts.joined(separator: " · ") + " 走 VPN"
+        }
+        if splitRuleSummary != next {
+            splitRuleSummary = next
+        }
+    }
+
     /// 基础 CIDR 语法校验：X.X.X.X/N，N∈[0,32]，四段 0–255。
     private static func isValidCIDR(_ s: String) -> Bool {
         let parts = s.split(separator: "/", maxSplits: 1, omittingEmptySubsequences: false)
@@ -479,15 +567,10 @@ final class VPNController: ObservableObject {
         }
     }
 
-    // MARK: - SOCKS5 调度
+    // MARK: - SOCKS5 状态重置
     //
-    // 历史遗留：早期标准模式下也跑过 Swift 写的 Socks5Proxy，
-    // 但这是设计错误 —— 让用户以为三种模式可叠加，实际它们应该互斥：
-    //   - 代理模式：SOCKS5 由 ocproxy 提供（openconnect 的 child）
-    //   - 分流/全局模式：kernel 自动路由，不需要 SOCKS5
-    // 现在这个函数永远只是 stop（防御性），不再启动 Swift Socks5Proxy。
+    // 纯代理模式的 SOCKS5 由 ocproxy 提供；分流/全局模式不需要 SOCKS5。
     func applySocks5State() {
-        socks5.stop()
         socks5Active = false
         socks5Error = nil
     }
@@ -513,16 +596,18 @@ final class VPNController: ObservableObject {
 
     func refreshWiFiSSID(requestPermissionIfNeeded: Bool = false) {
         updateWiFiSSIDLocationPermissionState()
-        let changed = refreshCurrentWiFiSSID()
+        let changed = refreshCurrentWiFiSSID(fallbackMinInterval: requestPermissionIfNeeded ? 0 : 5)
         if requestPermissionIfNeeded, currentWiFiSSID == nil {
             wifiSSIDReader.requestLocationPermissionIfNeeded()
             updateWiFiSSIDLocationPermissionState()
-            wifiOnDemandStatusText = missingWiFiSSIDStatusText(
-                pendingText: "正在读取当前 Wi-Fi…"
-            )
-            scheduleWiFiSSIDFallback(trigger: "手动刷新 Wi-Fi", minInterval: 0)
-        } else if currentWiFiSSID == nil {
-            scheduleWiFiSSIDFallback(trigger: "刷新 Wi-Fi", minInterval: 5)
+            if !wifiAssociated {
+                wifiOnDemandStatusText = "当前未连接 Wi-Fi"
+            } else if wifiSSIDLocationPermissionRequired {
+                wifiOnDemandStatusText = missingWiFiSSIDStatusText()
+            } else {
+                wifiOnDemandStatusText = "正在读取当前 Wi-Fi…"
+                scheduleWiFiSSIDFallback(trigger: "手动刷新 Wi-Fi", minInterval: 0)
+            }
         }
         if changed, wifiOnDemandEnabled {
             _ = applyWiFiOnDemandPolicy(trigger: "刷新 Wi-Fi")
@@ -539,16 +624,23 @@ final class VPNController: ObservableObject {
     }
 
     func evaluateWiFiOnDemandNow() {
+        suppressedAutoConnectSSID = nil
         _ = refreshCurrentWiFiSSID()
-        _ = applyWiFiOnDemandPolicy(trigger: "手动检查 Wi-Fi 规则")
+        _ = applyWiFiOnDemandPolicy(trigger: "手动检查 Wi-Fi 规则", respectManualSuppression: false)
     }
 
     func addCurrentWiFiRule(action: WiFiOnDemandAction) {
         guard let ssid = currentWiFiSSID else {
             wifiSSIDReader.requestLocationPermissionIfNeeded()
-            scheduleWiFiSSIDFallback(trigger: "添加当前 Wi-Fi", minInterval: 0)
-            wifiOnDemandStatusText = "正在读取当前 Wi-Fi…"
-            statusText = "正在读取当前 Wi-Fi，请稍后再添加"
+            updateWiFiSSIDLocationPermissionState()
+            if wifiAssociated && !wifiSSIDLocationPermissionRequired {
+                scheduleWiFiSSIDFallback(trigger: "添加当前 Wi-Fi", minInterval: 0)
+                wifiOnDemandStatusText = "正在读取当前 Wi-Fi…"
+                statusText = "正在读取当前 Wi-Fi，请稍后再添加"
+            } else {
+                wifiOnDemandStatusText = missingWiFiSSIDStatusText()
+                statusText = wifiOnDemandStatusText
+            }
             return
         }
         addWiFiRule(ssid: ssid, action: action)
@@ -557,6 +649,9 @@ final class VPNController: ObservableObject {
     func addWiFiRule(ssid: String, action: WiFiOnDemandAction) {
         let normalized = WiFiOnDemandRule.normalizedSSID(ssid)
         guard !normalized.isEmpty else { return }
+        if suppressedAutoConnectSSID == normalized {
+            suppressedAutoConnectSSID = nil
+        }
         wifiOnDemandRules = WiFiOnDemandPolicy.replacingOrAppending(
             wifiOnDemandRules,
             ssid: normalized,
@@ -564,39 +659,77 @@ final class VPNController: ObservableObject {
         )
         wifiOnDemandStatusText = "已保存 Wi-Fi 规则：\(normalized)"
         if wifiOnDemandEnabled {
-            _ = applyWiFiOnDemandPolicy(trigger: "保存 Wi-Fi 规则")
+            _ = applyWiFiOnDemandPolicy(trigger: "保存 Wi-Fi 规则", respectManualSuppression: false)
         }
     }
 
     func updateWiFiRule(id: UUID, action: WiFiOnDemandAction) {
         guard let idx = wifiOnDemandRules.firstIndex(where: { $0.id == id }) else { return }
+        if suppressedAutoConnectSSID == wifiOnDemandRules[idx].ssid {
+            suppressedAutoConnectSSID = nil
+        }
         wifiOnDemandRules[idx].action = action
         if wifiOnDemandEnabled {
-            _ = applyWiFiOnDemandPolicy(trigger: "更新 Wi-Fi 规则")
+            _ = applyWiFiOnDemandPolicy(trigger: "更新 Wi-Fi 规则", respectManualSuppression: false)
         }
     }
 
     func removeWiFiRule(id: UUID) {
         wifiOnDemandRules.removeAll { $0.id == id }
         if wifiOnDemandEnabled {
-            _ = applyWiFiOnDemandPolicy(trigger: "删除 Wi-Fi 规则")
+            _ = applyWiFiOnDemandPolicy(trigger: "删除 Wi-Fi 规则", respectManualSuppression: false)
         }
+    }
+
+    private var currentWiFiAssociationState: WiFiAssociationState {
+        // 明确未关联 Wi-Fi，或当前活跃默认出口为有线/USB 等非 Wi-Fi 时，不再按 Wi-Fi 规则干预。
+        if !wifiAssociated {
+            return .notOnWiFi
+        }
+        if hasPathSnapshot && networkSatisfied && !networkUsesWiFi {
+            return .notOnWiFi
+        }
+        if let ssid = currentWiFiSSID {
+            return .associated(ssid: ssid)
+        }
+        return .associatedUnknownSSID
     }
 
     @discardableResult
     private func refreshCurrentWiFiSSID(fallbackMinInterval: TimeInterval = 8) -> Bool {
-        guard let ssid = wifiSSIDReader.currentSSID() else {
-            let changed = setObservedWiFiSSID(nil)
-            scheduleWiFiSSIDFallback(trigger: "读取 Wi-Fi", minInterval: fallbackMinInterval)
-            return changed
+        updateWiFiSSIDLocationPermissionState()
+        let snapshot = wifiSSIDReader.currentInterfaceSnapshot()
+        wifiAssociated = snapshot.isAssociatedToWiFi
+
+        if let ssid = snapshot.ssid {
+            return setObservedWiFiSSID(ssid)
         }
-        return setObservedWiFiSSID(ssid)
+
+        // 未关联 Wi-Fi（关闭 Wi-Fi / 仅插网线）：明确清空，不拉起昂贵的 system_profiler。
+        guard snapshot.isAssociatedToWiFi else {
+            return setObservedWiFiSSID(nil)
+        }
+
+        // macOS 14+ 缺少定位权限时，system_profiler 同样只会返回 <redacted>，直接跳过。
+        if wifiSSIDLocationPermissionRequired {
+            return setObservedWiFiSSID(nil)
+        }
+
+        // 已关联 Wi-Fi 且有定位权限，但 CoreWLAN 暂未返回 SSID：
+        // 不要立刻把已缓存的 SSID 抹成 nil（避免短暂抖动触发误拆隧道），改由异步 fallback 核实后再更新。
+        scheduleWiFiSSIDFallback(trigger: "读取 Wi-Fi", minInterval: fallbackMinInterval)
+        return false
     }
 
     @discardableResult
     private func setObservedWiFiSSID(_ ssid: String?) -> Bool {
         let normalized = ObservedWiFiSSID.normalized(ssid)
-        currentWiFiSSID = normalized
+        if currentWiFiSSID != normalized {
+            currentWiFiSSID = normalized
+        }
+        if let suppressed = suppressedAutoConnectSSID, suppressed != normalized {
+            suppressedAutoConnectSSID = nil
+        }
         let previous = lastObservedSSID
         lastObservedSSID = normalized
         if !hasObservedSSID {
@@ -608,6 +741,7 @@ final class VPNController: ObservableObject {
 
     private func scheduleWiFiSSIDFallback(trigger: String, minInterval: TimeInterval) {
         guard !wifiSSIDFallbackInFlight else { return }
+        guard wifiAssociated, !wifiSSIDLocationPermissionRequired else { return }
         let now = Date()
         if let last = lastWiFiSSIDFallbackStartedAt,
            now.timeIntervalSince(last) < minInterval {
@@ -617,58 +751,94 @@ final class VPNController: ObservableObject {
         wifiSSIDFallbackInFlight = true
         lastWiFiSSIDFallbackStartedAt = now
 
-        Task.detached {
-            let ssid = WiFiSSIDReader.currentSSIDFromSystemProfiler()
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.wifiSSIDFallbackInFlight = false
-                self.setObservedWiFiSSID(ssid)
+        let task = Task { @MainActor [weak self] in
+            let ssid = await OpenConnectRunner.runBlocking {
+                WiFiSSIDReader.currentSSIDFromSystemProfiler()
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.wifiSSIDFallbackInFlight = false
+            self.wifiSSIDFallbackTask = nil
 
-                if self.wifiOnDemandEnabled {
-                    if ssid != nil {
+            let changed = self.setObservedWiFiSSID(ssid)
+
+            if self.wifiOnDemandEnabled {
+                if ssid != nil {
+                    if changed || self.pausedByWiFiPolicy || !self.isConnected {
                         _ = self.applyWiFiOnDemandPolicy(trigger: "\(trigger)（系统信息）")
-                    } else {
-                        self.wifiOnDemandStatusText = self.missingWiFiSSIDStatusText()
                     }
-                } else if ssid != nil {
-                    self.wifiOnDemandStatusText = "已读取当前 Wi-Fi"
                 } else {
                     self.wifiOnDemandStatusText = self.missingWiFiSSIDStatusText()
                 }
+            } else if ssid != nil {
+                self.wifiOnDemandStatusText = "已读取当前 Wi-Fi"
+            } else {
+                self.wifiOnDemandStatusText = self.missingWiFiSSIDStatusText()
             }
         }
+        wifiSSIDFallbackTask = task
+    }
+
+    private func awaitPendingWiFiFallback(timeout: TimeInterval) async {
+        guard let fallbackTask = wifiSSIDFallbackTask else { return }
+        let deadline = Date().addingTimeInterval(timeout)
+        while wifiSSIDFallbackInFlight, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        _ = fallbackTask
     }
 
     private func updateWiFiSSIDLocationPermissionState() {
-        wifiSSIDLocationPermissionRequired = wifiSSIDReader.isLocationPermissionRequired
+        let required = wifiSSIDReader.isLocationPermissionRequired
+        if wifiSSIDLocationPermissionRequired != required {
+            wifiSSIDLocationPermissionRequired = required
+        }
     }
 
     private func missingWiFiSSIDStatusText(
         pendingText: String = "未读取到当前 Wi-Fi"
     ) -> String {
+        if !wifiAssociated {
+            return "当前未连接 Wi-Fi"
+        }
+        if !wifiSSIDReader.isLocationServicesEnabled {
+            return "请在系统设置中开启定位服务"
+        }
         if wifiSSIDLocationPermissionRequired {
             return "请在系统设置中允许 XDVPN 使用定位服务"
         }
         return pendingText
     }
 
-    private var currentWiFiPolicyDecision: WiFiOnDemandDecision {
+    private var currentWiFiPolicy: WiFiOnDemandPolicy {
         WiFiOnDemandPolicy(isEnabled: wifiOnDemandEnabled, rules: wifiOnDemandRules)
-            .decision(for: currentWiFiSSID)
+    }
+
+    private func flushPendingWiFiPolicyIfNeeded() {
+        guard wifiOnDemandEnabled, !isBusy else { return }
+        _ = refreshCurrentWiFiSSID(fallbackMinInterval: 8)
+        _ = applyWiFiOnDemandPolicy(trigger: "忙状态结束补查 Wi-Fi 规则")
     }
 
     @discardableResult
-    private func applyWiFiOnDemandPolicy(trigger: String) -> Bool {
+    private func applyWiFiOnDemandPolicy(
+        trigger: String,
+        respectManualSuppression: Bool = true
+    ) -> Bool {
         guard wifiOnDemandEnabled else {
             pausedByWiFiPolicy = false
+            pendingWiFiPolicyReevaluation = false
             wifiOnDemandStatusText = "未启用"
             return false
         }
 
-        switch currentWiFiPolicyDecision {
+        let state = currentWiFiAssociationState
+        let outcome = currentWiFiPolicy.evaluate(state: state, wasPaused: pausedByWiFiPolicy)
+        let wasPaused = pausedByWiFiPolicy
+
+        switch outcome.decision {
         case .disconnect:
             let ssid = currentWiFiSSID ?? "未知 Wi-Fi"
-            pausedByWiFiPolicy = true
+            pausedByWiFiPolicy = outcome.shouldPause
             shouldReconnectAfterWake = false
             cancelAutoReconnect()
             wifiOnDemandStatusText = "当前 Wi-Fi「\(ssid)」规则：断开 VPN"
@@ -682,7 +852,10 @@ final class VPNController: ObservableObject {
                 )
                 return true
             }
-            guard !isBusy else { return true }
+            guard !isBusy else {
+                pendingWiFiPolicyReevaluation = true
+                return true
+            }
             if isConnected {
                 disconnectDueToWiFiPolicy(ssid: ssid)
             } else {
@@ -692,11 +865,17 @@ final class VPNController: ObservableObject {
 
         case .connect:
             let ssid = currentWiFiSSID ?? "未知 Wi-Fi"
-            pausedByWiFiPolicy = false
+            pausedByWiFiPolicy = outcome.shouldPause
             wifiOnDemandStatusText = "当前 Wi-Fi「\(ssid)」规则：连接 VPN"
 
+            if respectManualSuppression, suppressedAutoConnectSSID == ssid {
+                return false
+            }
             guard !isConnected else { return false }
-            guard !isBusy else { return true }
+            guard !isBusy else {
+                pendingWiFiPolicyReevaluation = true
+                return true
+            }
             guard hasCredentials else {
                 statusText = "当前 Wi-Fi「\(ssid)」需要连接 VPN，但凭据不完整"
                 appLog(.warn, "\(trigger)：SSID \(ssid) 命中连接规则，但凭据不完整")
@@ -713,21 +892,33 @@ final class VPNController: ObservableObject {
             return true
 
         case .noMatch:
-            if pausedByWiFiPolicy {
-                if let ssid = currentWiFiSSID {
-                    pausedByWiFiPolicy = false
-                    wifiOnDemandStatusText = "当前 Wi-Fi「\(ssid)」未配置规则"
-                    appLog(.info, "\(trigger)：已离开断开规则 Wi-Fi，解除暂停")
-                    return false
-                }
+            pausedByWiFiPolicy = outcome.shouldPause
+            if outcome.blocksAutomaticConnect {
                 wifiOnDemandStatusText = "无法读取当前 Wi-Fi，保持 VPN 暂停"
                 statusText = "无法读取当前 Wi-Fi，VPN 自动连接已暂停"
                 return true
             }
 
-            if let ssid = currentWiFiSSID {
+            if wasPaused {
+                switch state {
+                case .notOnWiFi:
+                    wifiOnDemandStatusText = "当前未经由 Wi-Fi，已解除暂停"
+                    appLog(.info, "\(trigger)：已离开 Wi-Fi（或切至有线），解除暂停")
+                case .associated(let ssid):
+                    wifiOnDemandStatusText = "当前 Wi-Fi「\(ssid)」未配置规则"
+                    appLog(.info, "\(trigger)：已离开断开规则 Wi-Fi，解除暂停")
+                case .associatedUnknownSSID:
+                    wifiOnDemandStatusText = missingWiFiSSIDStatusText()
+                }
+                return false
+            }
+
+            switch state {
+            case .associated(let ssid):
                 wifiOnDemandStatusText = "当前 Wi-Fi「\(ssid)」未配置规则"
-            } else {
+            case .notOnWiFi:
+                wifiOnDemandStatusText = wifiAssociated ? "当前主网络非 Wi-Fi" : "当前未连接 Wi-Fi"
+            case .associatedUnknownSSID:
                 wifiOnDemandStatusText = missingWiFiSSIDStatusText()
             }
             return false
@@ -739,27 +930,26 @@ final class VPNController: ObservableObject {
         statusText = "当前 Wi-Fi「\(ssid)」配置为断开，正在断开 VPN…"
 
         let disconnectMode = activeMode ?? runningMode
-        Task.detached { [weak self] in
-            let errMsg: String?
-            do {
-                try Self.cleanup(mode: disconnectMode)
-                errMsg = nil
-            } catch {
-                errMsg = error.localizedDescription
-            }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.isBusy = false
-                self.isConnected = false
-                self.activeMode = nil
-                self.clearDiagnostics()
-                if let errMsg {
-                    self.statusText = "Wi-Fi 规则断开失败：\(errMsg)"
-                    appLog(.error, "Wi-Fi 规则断开失败：\(errMsg)")
-                } else {
-                    self.statusText = "已因 Wi-Fi「\(ssid)」断开 VPN"
-                    appLog(.info, "已因 Wi-Fi「\(ssid)」断开 VPN")
+        Task { [weak self] in
+            let errMsg: String? = await OpenConnectRunner.runBlocking {
+                do {
+                    try Self.cleanup(mode: disconnectMode)
+                    return nil
+                } catch {
+                    return error.localizedDescription
                 }
+            }
+            guard let self else { return }
+            self.isBusy = false
+            self.isConnected = false
+            self.activeMode = nil
+            self.clearDiagnostics()
+            if let errMsg {
+                self.statusText = "Wi-Fi 规则断开失败：\(errMsg)"
+                appLog(.error, "Wi-Fi 规则断开失败：\(errMsg)")
+            } else {
+                self.statusText = "已因 Wi-Fi「\(ssid)」断开 VPN"
+                appLog(.info, "已因 Wi-Fi「\(ssid)」断开 VPN")
             }
         }
     }
@@ -768,21 +958,26 @@ final class VPNController: ObservableObject {
         guard wifiOnDemandEnabled else { return false }
         _ = refreshCurrentWiFiSSID()
 
-        switch currentWiFiPolicyDecision {
+        let state = currentWiFiAssociationState
+        let outcome = currentWiFiPolicy.evaluate(state: state, wasPaused: pausedByWiFiPolicy)
+        pausedByWiFiPolicy = outcome.shouldPause
+
+        guard outcome.blocksAutomaticConnect else { return false }
+
+        switch outcome.decision {
         case .disconnect:
             let ssid = currentWiFiSSID ?? "未知 Wi-Fi"
-            pausedByWiFiPolicy = true
             cancelAutoReconnect()
             wifiOnDemandStatusText = "当前 Wi-Fi「\(ssid)」规则：断开 VPN"
             statusText = "当前 Wi-Fi「\(ssid)」配置为断开 VPN"
             appLog(.info, "\(trigger)：SSID \(ssid) 命中断开规则，停止自动连接")
             return true
-        case .noMatch where pausedByWiFiPolicy && currentWiFiSSID == nil:
+        case .noMatch:
             wifiOnDemandStatusText = "无法读取当前 Wi-Fi，保持 VPN 暂停"
             statusText = "无法读取当前 Wi-Fi，VPN 自动连接已暂停"
             appLog(.warn, "\(trigger)：无法读取 SSID，保持 Wi-Fi 策略暂停")
             return true
-        case .connect, .noMatch:
+        case .connect:
             return false
         }
     }
@@ -845,29 +1040,28 @@ final class VPNController: ObservableObject {
         statusText = "正在切换到\(targetMode.label)…"
         appLog(.info, "切换运行模式：\(currentMode.label) → \(targetMode.label)")
 
-        Task.detached { [weak self] in
-            let errMsg: String?
-            do {
-                try Self.cleanup(mode: currentMode)
-                errMsg = nil
-            } catch {
-                errMsg = error.localizedDescription
-            }
-
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.isBusy = false
-                if let errMsg {
-                    self.statusText = "切换失败：\(errMsg)"
-                    appLog(.error, "切换模式清理失败：\(errMsg)")
-                    return
+        Task { [weak self] in
+            let errMsg: String? = await OpenConnectRunner.runBlocking {
+                do {
+                    try Self.cleanup(mode: currentMode)
+                    return nil
+                } catch {
+                    return error.localizedDescription
                 }
-
-                self.isConnected = false
-                self.activeMode = nil
-                self.clearDiagnostics()
-                self.switchToModeAndConnectIfPossible(targetMode)
             }
+
+            guard let self else { return }
+            self.isBusy = false
+            if let errMsg {
+                self.statusText = "切换失败：\(errMsg)"
+                appLog(.error, "切换模式清理失败：\(errMsg)")
+                return
+            }
+
+            self.isConnected = false
+            self.activeMode = nil
+            self.clearDiagnostics()
+            self.switchToModeAndConnectIfPossible(targetMode)
         }
     }
 
@@ -892,6 +1086,9 @@ final class VPNController: ObservableObject {
         Task { @MainActor [weak self] in
             try? await Task.sleep(nanoseconds: 500_000_000)
             guard let self else { return }
+            if self.wifiOnDemandEnabled {
+                await self.awaitPendingWiFiFallback(timeout: 2.5)
+            }
             // Wi-Fi 规则和传统“启动时自动连接”是两套独立开关。即使后者关闭，
             // 启动时也必须执行已启用的当前 SSID 规则。
             if self.wifiOnDemandEnabled,
@@ -909,6 +1106,9 @@ final class VPNController: ObservableObject {
     /// silent=true 为自动重连：跳过 BiometricGate（无人值守/远程无 Touch ID 不卡），
     /// 只复用内存里的密码；失败会沿退避链推进。silent=false 为用户手动连接。
     func connect(silent: Bool = false) {
+        if !silent {
+            suppressedAutoConnectSSID = nil
+        }
         if silent, isWiFiPolicyBlockingAutomaticConnect(trigger: "自动连接") { return }
         guard canConnect else { return }
         isBusy = true
@@ -930,9 +1130,11 @@ final class VPNController: ObservableObject {
 
         let rootCleanupRequired = !proxyMode || sudoConfigured
         let startupCleanupTask = self.startupCleanupTask
-        let task = Task.detached { [weak self] in
+        let task = Task { [weak self] in
             // 先清两种模式的所有残留 —— 用户可能从对方模式切过来，旧进程还在
-            OpenConnectRunner.disconnectProxyMode()
+            await OpenConnectRunner.runBlocking {
+                OpenConnectRunner.disconnectProxyMode()
+            }
 
             // 连接
             let result: Result<Void, Error>
@@ -944,22 +1146,25 @@ final class VPNController: ObservableObject {
                     throw VPNError.cleanupFailed(cleanupErrorMessage)
                 }
                 if !silent { try await BiometricGate.ensure() }
+                guard !Task.isCancelled else { return }
                 if proxyMode {
-                    if rootCleanupRequired { try OpenConnectRunner.cleanup() }
-                    guard !Task.isCancelled else { return }
-                    try OpenConnectRunner.connectProxyMode(
-                        protocolName: p, server: s, user: u, password: pw, socksPort: socksPort
-                    )
+                    try await OpenConnectRunner.runBlocking {
+                        if rootCleanupRequired { try OpenConnectRunner.cleanup() }
+                        try OpenConnectRunner.connectProxyMode(
+                            protocolName: p, server: s, user: u, password: pw, socksPort: socksPort
+                        )
+                    }
                 } else {
-                    try OpenConnectRunner.replaceConnection(
-                        protocolName: p,
-                        server: s,
-                        user: u,
-                        password: pw
-                    ) {
-                        guard !Task.isCancelled else { throw CancellationError() }
-                        Self.writeSplitConfFile(enabled: splitOn, cidrs: splitCIDRs)
-                        Self.writeDomainConfFile(enabled: splitOn, domains: domainSuffixes)
+                    try await OpenConnectRunner.runBlocking {
+                        try OpenConnectRunner.replaceConnection(
+                            protocolName: p,
+                            server: s,
+                            user: u,
+                            password: pw
+                        ) {
+                            Self.writeSplitConfFile(enabled: splitOn, cidrs: splitCIDRs)
+                            Self.writeDomainConfFile(enabled: splitOn, domains: domainSuffixes)
+                        }
                     }
                 }
                 result = .success(())
@@ -1036,7 +1241,10 @@ final class VPNController: ObservableObject {
             return
         }
         guard isConnected, !isBusy else { return }
-        // 用户主动断开 → 取消任何待执行的自动重连
+        // 用户主动断开 → 取消任何待执行的自动重连，并在当前 SSID 会话内抑制「自动连接」规则立刻拉回
+        if wifiOnDemandEnabled, let ssid = currentWiFiSSID {
+            suppressedAutoConnectSSID = ssid
+        }
         cancelAutoReconnect()
         isBusy = true
         statusText = "正在断开…"
@@ -1044,27 +1252,29 @@ final class VPNController: ObservableObject {
 
         let disconnectMode = activeMode ?? runningMode
 
-        Task.detached { [weak self] in
-            let errMsg: String?
-            do {
-                try Self.cleanup(mode: disconnectMode)
-                errMsg = nil
-            } catch {
-                errMsg = error.localizedDescription
+        Task { [weak self] in
+            let errMsg: String? = await OpenConnectRunner.runBlocking {
+                do {
+                    try Self.cleanup(mode: disconnectMode)
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
             }
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.isBusy = false
-                self.isConnected = false
-                self.activeMode = nil
-                self.clearDiagnostics()
-                self.statusText = errMsg ?? "未连接"
-            }
+            guard let self else { return }
+            self.isBusy = false
+            self.isConnected = false
+            self.activeMode = nil
+            self.clearDiagnostics()
+            self.statusText = errMsg ?? "未连接"
         }
     }
 
     func cancelConnection() {
         guard isConnecting else { return }
+        if wifiOnDemandEnabled, let ssid = currentWiFiSSID {
+            suppressedAutoConnectSSID = ssid
+        }
         appLog(.info, "用户取消连接")
         cancelPendingConnection(
             status: "已取消连接",
@@ -1089,36 +1299,30 @@ final class VPNController: ObservableObject {
         statusText = "正在取消连接…"
         if resetReconnect { cancelAutoReconnect() }
 
-        Task.detached { [weak self] in
-            OpenConnectRunner.cancelPendingConnection()
-            let cleanupSucceeded: Bool
-            let cleanupErrorMessage: String?
-            if mode == .proxy {
-                OpenConnectRunner.disconnectProxyMode()
-                cleanupSucceeded = true
-                cleanupErrorMessage = nil
-            } else {
+        Task { [weak self] in
+            let (cleanupSucceeded, cleanupErrorMessage): (Bool, String?) = await OpenConnectRunner.runBlocking {
+                OpenConnectRunner.cancelPendingConnection()
+                if mode == .proxy {
+                    OpenConnectRunner.disconnectProxyMode()
+                    return (true, nil)
+                }
                 do {
                     try OpenConnectRunner.cleanup()
-                    cleanupSucceeded = true
-                    cleanupErrorMessage = nil
+                    return (true, nil)
                 } catch {
-                    cleanupSucceeded = false
-                    cleanupErrorMessage = error.localizedDescription
+                    return (false, error.localizedDescription)
                 }
             }
-            await MainActor.run { [weak self] in
-                guard let self, self.connectionAttemptID == nil else { return }
-                self.isBusy = false
-                guard cleanupSucceeded else {
-                    self.cancelAutoReconnect()
-                    self.statusText = "网络清理失败，已停止重连：\(cleanupErrorMessage ?? "未知错误")"
-                    appLog(.error, "取消连接：\(self.statusText)")
-                    return
-                }
-                self.statusText = status
-                if reconnectAfterCleanup { self.onTunnelLost() }
+            guard let self, self.connectionAttemptID == nil else { return }
+            self.isBusy = false
+            guard cleanupSucceeded else {
+                self.cancelAutoReconnect()
+                self.statusText = "网络清理失败，已停止重连：\(cleanupErrorMessage ?? "未知错误")"
+                appLog(.error, "取消连接：\(self.statusText)")
+                return
             }
+            self.statusText = status
+            if reconnectAfterCleanup { self.onTunnelLost() }
         }
     }
 
@@ -1127,77 +1331,137 @@ final class VPNController: ObservableObject {
     func installSudoers(thenConnect: Bool = false) {
         isBusy = true
         statusText = "正在安装组件…"
-        Task.detached { [weak self] in
-            let errMsg: String? = {
+        Task { [weak self] in
+            let (errMsg, installed): (String?, Bool) = await OpenConnectRunner.runBlocking {
+                let err: String?
                 do {
                     try SudoersInstaller.install()
                     // 装完之后同步跑一次 cleanup，顺手把 v0.2 残余（如果有）也清了。
                     // 完成后才允许自动连接，避免后台 cleanup 删掉新连接的 split/domain conf。
                     try OpenConnectRunner.cleanup()
-                    return nil
+                    err = nil
+                } catch {
+                    err = error.localizedDescription
                 }
-                catch { return error.localizedDescription }
-            }()
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.isBusy = false
-                self.sudoConfigured = SudoersInstaller.isInstalled
-                if let errMsg { self.statusText = errMsg }
-                else if !self.isConnected { self.statusText = "未连接" }
-                // 配置成功 + 凭据齐全 → 自动连接
-                if errMsg == nil, thenConnect, self.canConnect {
-                    self.connect()
-                }
+                return (err, SudoersInstaller.isInstalled)
+            }
+            guard let self else { return }
+            self.isBusy = false
+            self.sudoConfigured = installed
+            if let errMsg { self.statusText = errMsg }
+            else if !self.isConnected { self.statusText = "未连接" }
+            // 配置成功 + 凭据齐全 → 自动连接
+            if errMsg == nil, thenConnect, self.canConnect {
+                self.connect()
             }
         }
     }
 
     func uninstallSudoers() {
         isBusy = true
-        Task.detached { [weak self] in
-            try? SudoersInstaller.uninstall()
-            await MainActor.run { [weak self] in
-                guard let self else { return }
-                self.isBusy = false
-                self.sudoConfigured = SudoersInstaller.isInstalled
+        Task { [weak self] in
+            let installed = await OpenConnectRunner.runBlocking {
+                try? SudoersInstaller.uninstall()
+                return SudoersInstaller.isInstalled
             }
+            guard let self else { return }
+            self.isBusy = false
+            self.sudoConfigured = installed
         }
     }
 
     // MARK: - Polling
 
     private func startPolling() {
-        pollTimer?.invalidate()
-        // 1s 心跳：实时速率（菜单栏外显）需要每秒刷新一次才有"动"的感觉
+        guard pollTimer == nil else { return }
+        pollTickCount = 0
+        // 仅在连接态启动心跳；设 tolerance 允许系统合并定时器唤醒，降低空闲耗电。
         let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
             Task { @MainActor [weak self] in
                 self?.pollTick()
             }
         }
+        timer.tolerance = 0.2
         // .common 模式 → 菜单展开/拖窗等期间也继续 fire
         RunLoop.main.add(timer, forMode: .common)
         pollTimer = timer
     }
 
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        pollInFlight = false
+        pollTickCount = 0
+    }
+
     private func pollTick() {
+        guard isConnected, !pollInFlight else { return }
+        pollInFlight = true
+        pollTickCount &+= 1
+
+        let mode = activeMode ?? runningMode
+        let previousStamp = cachedSessionStamp
+        let currentIface = tunnelInterface
+        // 仅在需要实时速率展示（菜单栏外显/主窗口可见）或 full 模式黑洞检测时每秒采流量；
+        // 后台静默 split 模式每 5 秒采一次接口统计，但每秒仍检查进程存活。
+        let needsHighFreqTraffic = showSpeedInMenuBar || isMainWindowVisible || mode == .full
+        let shouldSampleTraffic = mode != .proxy && (needsHighFreqTraffic || pollTickCount % 5 == 0)
+
+        pollQueue.async { [weak self] in
+            let running = mode == .proxy ? OpenConnectRunner.isProxyModeRunning : OpenConnectRunner.isRunning
+
+            var parsedSession: RouteScriptSession?
+            var nextStamp = previousStamp
+            var effectiveIface = currentIface
+
+            if running, mode != .proxy {
+                let (session, stamp) = Self.readSessionFileIfChanged(previousStamp: previousStamp)
+                parsedSession = session
+                nextStamp = stamp
+                if let session {
+                    effectiveIface = session.tunnelInterface
+                }
+            }
+
+            let info: TunnelInfo?
+            if running, shouldSampleTraffic, let iface = effectiveIface {
+                info = Self.queryTunnel(iface)
+            } else {
+                info = nil
+            }
+
+            let sample = PollSample(
+                processAlive: running,
+                session: parsedSession,
+                sessionStamp: nextStamp,
+                tunnelInfo: info
+            )
+            Task { @MainActor [weak self] in
+                self?.applyPollSample(sample, mode: mode)
+            }
+        }
+    }
+
+    private func applyPollSample(_ sample: PollSample, mode: RunningMode) {
+        pollInFlight = false
         guard isConnected else { return }
 
-        // 按当前模式检查对应的 openconnect 进程是否还活着
-        let mode = activeMode ?? runningMode
-        let running = mode == .proxy ? OpenConnectRunner.isProxyModeRunning : OpenConnectRunner.isRunning
-        if isConnected, running, mode != .proxy {
-            // 标准模式才采流量/解析 session；纯代理模式拿不到这些数据。
-            // openconnect 长时间运行中可能内部重连并换一个 utun，session 文件是最新来源。
-            parseSessionFile()
-            updateTrafficStats()
-            trackInbound()
+        if sample.processAlive, mode != .proxy {
+            cachedSessionStamp = sample.sessionStamp
+            if let session = sample.session {
+                applySession(session)
+            }
+            if let info = sample.tunnelInfo {
+                applyTunnelTraffic(info)
+                trackInbound()
+            }
         }
         guard !isBusy else { return }
 
         // 健康判定（纯逻辑、已单测）：进程死 / 黑洞 → 重连；健康 → 喂稳定窗口
         let facts = TunnelFacts(
             declaredConnected: isConnected,
-            processAlive: running,
+            processAlive: sample.processAlive,
             mode: coreMode,
             secsSinceConnect: connectedAt.map { Date().timeIntervalSince($0) } ?? 9999,
             graceSeconds: 15,
@@ -1228,15 +1492,15 @@ final class VPNController: ObservableObject {
         statusText = "连接已丢失，正在清理…"
         let mode = activeMode ?? runningMode
         if mode == .proxy {
-            Task.detached { [weak self] in
-                OpenConnectRunner.disconnectProxyMode()
-                await MainActor.run { [weak self] in
-                    guard let self else { return }
-                    self.isConnected = false
-                    self.activeMode = nil
-                    self.isBusy = false
-                    self.onTunnelLost()
+            Task { [weak self] in
+                await OpenConnectRunner.runBlocking {
+                    OpenConnectRunner.disconnectProxyMode()
                 }
+                guard let self else { return }
+                self.isConnected = false
+                self.activeMode = nil
+                self.isBusy = false
+                self.onTunnelLost()
             }
         } else {
             runCleanupDetached(reason: "意外断开自动清理") { [weak self] in
@@ -1316,6 +1580,11 @@ final class VPNController: ObservableObject {
         guard isAutoReconnecting, !isConnected, !isBusy else { return }
         if !networkSatisfied { appLog(.info, "等待网络就绪…") }
         await awaitNetworkReady(timeout: 8)
+        guard isAutoReconnecting, !isConnected, !isBusy else { return }
+        if wifiOnDemandEnabled {
+            _ = refreshCurrentWiFiSSID(fallbackMinInterval: 4)
+            await awaitPendingWiFiFallback(timeout: 2.0)
+        }
         guard isAutoReconnecting, !isConnected, !isBusy else { return }
         if isWiFiPolicyBlockingAutomaticConnect(trigger: "自动重连") { return }
         guard hasCredentials else {
@@ -1412,16 +1681,16 @@ final class VPNController: ObservableObject {
             if isConnected || OpenConnectRunner.isProxyModeRunning {
                 isBusy = true
                 statusText = "休眠唤醒，正在清理…"
-                Task.detached { [weak self] in
-                    OpenConnectRunner.disconnectProxyMode()
-                    await MainActor.run { [weak self] in
-                        guard let self else { return }
-                        self.isConnected = false
-                        self.activeMode = nil
-                        self.isBusy = false
-                        self.statusText = "未连接"
-                        if shouldReconnect { self.reconnectAfterWake() }
+                Task { [weak self] in
+                    await OpenConnectRunner.runBlocking {
+                        OpenConnectRunner.disconnectProxyMode()
                     }
+                    guard let self else { return }
+                    self.isConnected = false
+                    self.activeMode = nil
+                    self.isBusy = false
+                    self.statusText = "未连接"
+                    if shouldReconnect { self.reconnectAfterWake() }
                 }
             } else if shouldReconnect {
                 reconnectAfterWake()
@@ -1447,10 +1716,9 @@ final class VPNController: ObservableObject {
         }
     }
 
-    /// 唤醒后自动重连。不再立即 connect()（会抢在 WiFi 握手前必失败）；
-    /// 改为等网络就绪再静默重连，失败沿退避链推进。凭据不全则静默跳过。
+    /// 唤醒后自动重连。不再立即 connect() 或在网卡未关联前就误判 Wi-Fi 规则；
+    /// 改为等网络就绪后再读取当前 Wi-Fi 并执行规则校验。凭据不全则静默跳过。
     private func reconnectAfterWake() {
-        if isWiFiPolicyBlockingAutomaticConnect(trigger: "唤醒自动重连") { return }
         guard hasCredentials else {
             statusText = "未连接（缺少凭据，请手动连接）"
             appLog(.warn, "唤醒后缺少凭据，不自动重连")
@@ -1466,12 +1734,40 @@ final class VPNController: ObservableObject {
 
     // MARK: - 诊断数据采集
 
-    private func parseSessionFile() {
+    nonisolated private static func sessionFileStamp() -> SessionFileStamp? {
+        var st = stat()
+        guard stat("/tmp/xdvpn.session", &st) == 0 else { return nil }
+        return SessionFileStamp(
+            mtimeSec: st.st_mtimespec.tv_sec,
+            mtimeNsec: st.st_mtimespec.tv_nsec,
+            size: st.st_size,
+            inode: st.st_ino
+        )
+    }
+
+    nonisolated private static func readSessionFileIfChanged(
+        previousStamp: SessionFileStamp?
+    ) -> (RouteScriptSession?, SessionFileStamp?) {
+        guard let stamp = sessionFileStamp() else { return (nil, nil) }
+        if stamp == previousStamp {
+            return (nil, stamp)
+        }
         guard let content = try? String(contentsOfFile: "/tmp/xdvpn.session", encoding: .utf8),
               let session = RouteScriptSession.parse(content) else {
-            return
+            return (nil, previousStamp)
         }
+        return (session, stamp)
+    }
 
+    private func parseSessionFile() {
+        let (session, stamp) = Self.readSessionFileIfChanged(previousStamp: cachedSessionStamp)
+        cachedSessionStamp = stamp
+        if let session {
+            applySession(session)
+        }
+    }
+
+    private func applySession(_ session: RouteScriptSession) {
         if let oldInterface = tunnelInterface, oldInterface != session.tunnelInterface {
             appLog(.info, "检测到隧道接口切换：\(oldInterface) -> \(session.tunnelInterface)")
             resetTrafficBaselines()
@@ -1493,7 +1789,10 @@ final class VPNController: ObservableObject {
 
     private func updateTrafficStats() {
         guard let iface = tunnelInterface else { return }
-        let info = Self.queryTunnel(iface)
+        applyTunnelTraffic(Self.queryTunnel(iface))
+    }
+
+    private func applyTunnelTraffic(_ info: TunnelInfo) {
         if tunnelIP != info.ip {
             tunnelIP = info.ip
         }
@@ -1526,10 +1825,9 @@ final class VPNController: ObservableObject {
         vpnGateway = nil
         activeRoutes = []
         dnsProxyActive = false
+        cachedSessionStamp = nil
         trafficMonitor.reset()
         lastTrafficSample = nil
-        // VPN 没了 socks 也必须停（出站绑的接口已无效）
-        socks5.stop()
         socks5Active = false
         socks5Error = nil
     }
@@ -1540,7 +1838,7 @@ final class VPNController: ObservableObject {
         resetBlackholeTracking()
     }
 
-    struct TunnelInfo {
+    struct TunnelInfo: Sendable {
         var ip: String?
         var bytesIn: UInt64 = 0
         var bytesOut: UInt64 = 0
@@ -1551,27 +1849,35 @@ final class VPNController: ObservableObject {
         guard getifaddrs(&ifap) == 0, let first = ifap else { return TunnelInfo() }
         defer { freeifaddrs(first) }
 
-        var info = TunnelInfo()
-        var cur: UnsafeMutablePointer<ifaddrs>? = first
-        while let ifa = cur {
-            defer { cur = ifa.pointee.ifa_next }
-            guard String(cString: ifa.pointee.ifa_name) == name,
-                  let addr = ifa.pointee.ifa_addr else { continue }
+        return name.withCString { targetName in
+            var info = TunnelInfo()
+            var foundIP = false
+            var foundLink = false
+            var cur: UnsafeMutablePointer<ifaddrs>? = first
+            while let ifa = cur {
+                defer { cur = ifa.pointee.ifa_next }
+                guard strcmp(ifa.pointee.ifa_name, targetName) == 0,
+                      let addr = ifa.pointee.ifa_addr else { continue }
 
-            let family = Int32(addr.pointee.sa_family)
-            if family == AF_INET {
-                var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
-                getnameinfo(addr, socklen_t(addr.pointee.sa_len),
-                            &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST)
-                info.ip = String(cString: buf)
+                let family = Int32(addr.pointee.sa_family)
+                if family == AF_INET {
+                    var buf = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+                    getnameinfo(addr, socklen_t(addr.pointee.sa_len),
+                                &buf, socklen_t(buf.count), nil, 0, NI_NUMERICHOST)
+                    info.ip = String(cString: buf)
+                    foundIP = true
+                } else if family == AF_LINK, let data = ifa.pointee.ifa_data {
+                    let d = data.assumingMemoryBound(to: if_data.self).pointee
+                    info.bytesIn = UInt64(d.ifi_ibytes)
+                    info.bytesOut = UInt64(d.ifi_obytes)
+                    foundLink = true
+                }
+                if foundIP && foundLink {
+                    break
+                }
             }
-            if family == AF_LINK, let data = ifa.pointee.ifa_data {
-                let d = data.assumingMemoryBound(to: if_data.self).pointee
-                info.bytesIn = UInt64(d.ifi_ibytes)
-                info.bytesOut = UInt64(d.ifi_obytes)
-            }
+            return info
         }
-        return info
     }
 
     var diagnosticsSummary: String {
@@ -1648,25 +1954,26 @@ final class VPNController: ObservableObject {
         reason: String,
         completion: (@MainActor () -> Void)? = nil
     ) -> Task<String?, Never> {
-        Task.detached { [weak self] in
-            let cleanupError: Error?
-            do {
-                try OpenConnectRunner.cleanup()
-                cleanupError = nil
-            } catch {
-                cleanupError = error
+        Task { [weak self] in
+            let cleanupErrorMessage: String? = await OpenConnectRunner.runBlocking {
+                do {
+                    try OpenConnectRunner.cleanup()
+                    return nil
+                } catch {
+                    return error.localizedDescription
+                }
             }
             // split/domain 配置由 cleanup helper 在 root operation gate 内删除。
             // 这里不能再删：新的 replaceConnection 可能已写入下一次连接的配置。
             await MainActor.run { [weak self] in
                 guard let self else { return }
-                let cleanupSucceeded = cleanupError == nil
+                let cleanupSucceeded = cleanupErrorMessage == nil
                 guard cleanupSucceeded else {
                     self.cancelAutoReconnect()
                     self.isConnected = false
                     self.activeMode = nil
                     self.isBusy = false
-                    self.statusText = "网络清理失败，已停止重连：\(cleanupError?.localizedDescription ?? "未知错误")"
+                    self.statusText = "网络清理失败，已停止重连：\(cleanupErrorMessage ?? "未知错误")"
                     appLog(.error, "\(reason)：\(self.statusText)")
                     return
                 }
@@ -1683,7 +1990,7 @@ final class VPNController: ObservableObject {
                 }
                 _ = reason  // 目前不输出日志，保留参数便于后续加 os_log
             }
-            return cleanupError?.localizedDescription
+            return cleanupErrorMessage
         }
     }
 }

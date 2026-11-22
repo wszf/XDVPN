@@ -84,4 +84,70 @@ final class WiFiOnDemandPolicyTests: XCTestCase {
         XCTAssertEqual(updated[0].ssid, "Office")
         XCTAssertEqual(updated[0].action, .disconnectVPN)
     }
+
+    func test_evaluateLeavingWiFiForEthernetClearsPausedState() {
+        let policy = WiFiOnDemandPolicy(
+            isEnabled: true,
+            rules: [WiFiOnDemandRule(ssid: "Office", action: .disconnectVPN)]
+        )
+
+        let outcome = policy.evaluate(state: .notOnWiFi, wasPaused: true)
+        XCTAssertEqual(outcome.decision, .noMatch)
+        XCTAssertFalse(outcome.shouldPause)
+        XCTAssertFalse(outcome.blocksAutomaticConnect)
+    }
+
+    func test_evaluateUnknownSSIDKeepsPauseOnlyWhenPreviouslyPaused() {
+        let policy = WiFiOnDemandPolicy(
+            isEnabled: true,
+            rules: [WiFiOnDemandRule(ssid: "Office", action: .disconnectVPN)]
+        )
+
+        let stillPaused = policy.evaluate(state: .associatedUnknownSSID, wasPaused: true)
+        XCTAssertEqual(stillPaused.decision, .noMatch)
+        XCTAssertTrue(stillPaused.shouldPause)
+        XCTAssertTrue(stillPaused.blocksAutomaticConnect)
+
+        let notPaused = policy.evaluate(state: .associatedUnknownSSID, wasPaused: false)
+        XCTAssertEqual(notPaused.decision, .noMatch)
+        XCTAssertFalse(notPaused.shouldPause)
+        XCTAssertFalse(notPaused.blocksAutomaticConnect)
+    }
+
+    func test_evaluateSwitchingFromDisconnectWiFiToOtherWiFiOrConnectRuleResumes() {
+        let policy = WiFiOnDemandPolicy(
+            isEnabled: true,
+            rules: [
+                WiFiOnDemandRule(ssid: "Office", action: .disconnectVPN),
+                WiFiOnDemandRule(ssid: "Home", action: .connectVPN),
+            ]
+        )
+
+        let paused = policy.evaluate(state: .associated(ssid: "Office"), wasPaused: false)
+        XCTAssertEqual(paused.decision, .disconnect)
+        XCTAssertTrue(paused.shouldPause)
+        XCTAssertTrue(paused.blocksAutomaticConnect)
+
+        let unmatched = policy.evaluate(state: .associated(ssid: "Cafe"), wasPaused: true)
+        XCTAssertEqual(unmatched.decision, .noMatch)
+        XCTAssertFalse(unmatched.shouldPause)
+        XCTAssertFalse(unmatched.blocksAutomaticConnect)
+
+        let connect = policy.evaluate(state: .associated(ssid: "Home"), wasPaused: true)
+        XCTAssertEqual(connect.decision, .connect)
+        XCTAssertFalse(connect.shouldPause)
+        XCTAssertFalse(connect.blocksAutomaticConnect)
+    }
+
+    func test_evaluateDisabledPolicyAlwaysClearsPause() {
+        let policy = WiFiOnDemandPolicy(
+            isEnabled: false,
+            rules: [WiFiOnDemandRule(ssid: "Office", action: .disconnectVPN)]
+        )
+
+        let outcome = policy.evaluate(state: .associated(ssid: "Office"), wasPaused: true)
+        XCTAssertEqual(outcome.decision, .noMatch)
+        XCTAssertFalse(outcome.shouldPause)
+        XCTAssertFalse(outcome.blocksAutomaticConnect)
+    }
 }
