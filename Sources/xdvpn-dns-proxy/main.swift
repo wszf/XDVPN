@@ -94,6 +94,23 @@ func utunExists(_ name: String) -> Bool {
 
 // MARK: - Route management
 
+/// 过滤不该加到 VPN 隧道的特殊 IPv4（回环、未指定、链路本地、多播/保留/广播），
+/// 防止它们反复触发失败的 `/sbin/route add` 或破坏本机回环流量。
+func isRoutableTunnelHostIP(_ ip: String) -> Bool {
+    let parts = ip.split(separator: ".", omittingEmptySubsequences: false)
+    guard parts.count == 4,
+          let a = UInt8(parts[0]),
+          let b = UInt8(parts[1]),
+          UInt8(parts[2]) != nil,
+          UInt8(parts[3]) != nil else {
+        return false
+    }
+    if a == 0 || a == 127 { return false }
+    if a == 169 && b == 254 { return false }
+    if a >= 224 { return false }
+    return true
+}
+
 func addRoute(host ip: String, interface utun: String) -> Bool {
     let proc = Process()
     proc.executableURL = URL(fileURLWithPath: "/sbin/route")
@@ -287,6 +304,9 @@ if let readyFile = config.readyFile {
 let routeCacheLock = NSLock()
 let routeInstallLock = NSLock()
 var routeOwnership = RouteOwnershipTracker<String>()
+/// 记录 `route add` 失败 IP 的时间戳（秒），30s 内不再重复 fork/exec `/sbin/route`。
+var failedRouteRetryAfter: [String: Int] = [:]
+let failedRouteCooldownSeconds = 30
 let dnsPacketLimit = 4096
 var recvBuf = [UInt8](repeating: 0, count: dnsPacketLimit)
 
@@ -376,22 +396,35 @@ func handleQuery(query: [UInt8], clientAddr: sockaddr_in, clientLen: socklen_t) 
             extractARecordIPs(from: ptr.baseAddress!, length: responseLen)
         }
         if !ips.isEmpty {
-            // 快路径：大多数查询命中已缓存路由，仅短持 routeCacheLock，绝不被新 IP 的 route add 阻塞。
+            let nowSec = time(nil)
+            // 快路径：过滤特殊地址并检查路由缓存/失败冷却，绝不被新 IP 的 route add 阻塞。
             routeCacheLock.lock()
-            let missingIPs = ips.filter { !routeOwnership.ownedRoutes.contains($0) }
+            let missingIPs = ips.filter { ip in
+                guard isRoutableTunnelHostIP(ip) else { return false }
+                if routeOwnership.ownedRoutes.contains(ip) { return false }
+                if let retryAfter = failedRouteRetryAfter[ip], nowSec < retryAfter { return false }
+                return true
+            }
             routeCacheLock.unlock()
 
             if !missingIPs.isEmpty {
                 routeInstallLock.lock()
                 for ip in missingIPs {
+                    let checkNow = time(nil)
                     routeCacheLock.lock()
-                    let alreadyOwned = routeOwnership.ownedRoutes.contains(ip)
+                    let skip = routeOwnership.ownedRoutes.contains(ip)
+                        || (failedRouteRetryAfter[ip].map { checkNow < $0 } ?? false)
                     routeCacheLock.unlock()
-                    if alreadyOwned { continue }
+                    if skip { continue }
 
                     if addRoute(host: ip, interface: config.utun) {
                         routeCacheLock.lock()
+                        failedRouteRetryAfter.removeValue(forKey: ip)
                         _ = routeOwnership.installIfNeeded(ip) { true }
+                        routeCacheLock.unlock()
+                    } else {
+                        routeCacheLock.lock()
+                        failedRouteRetryAfter[ip] = time(nil) + failedRouteCooldownSeconds
                         routeCacheLock.unlock()
                     }
                 }

@@ -5,9 +5,9 @@ import Foundation
 enum SudoersInstaller {
     /// 每次改 helper 脚本内容后递增。isInstalled 会校验磁盘上的版本号，
     /// 不匹配 → sudoConfigured=false → UI 自动提示"一键配置"覆盖升级。
-    // 14 而不是 12/13：v12 已被某 fork 发布过，v13 被 PR #11 占用。取更大的号，
-    // 确保这两种安装都会把本机 helper 判为需要升级。
-    static let helperVersion = 15
+    // 14 而不是 12/13：v12 已被某 fork 发布过，v13 被 PR #11 占用。
+    // 15：支持认证组（authgroup）。16：优化 full 模式系统代理快路径、DNS 代理条件等待与 cleanup 单次 DNS 刷新。
+    static let helperVersion = 16
 
     static let sudoersPath = "/etc/sudoers.d/xdvpn"
     static let privilegedHelperParentDir = "/Library/PrivilegedHelperTools"
@@ -89,12 +89,12 @@ enum SudoersInstaller {
             return false
         }
         defer { try? handle.close() }
-        let bytesToRead = max(signature.utf8.count, 128)
-        guard let data = try? handle.read(upToCount: bytesToRead),
-              let header = String(data: data, encoding: .utf8) else {
+        let expected = Data(signature.utf8)
+        // 只按签名字节长度读取并做字节比较，避免固定截断长度落在多字节 UTF-8 字符中间导致解码失败。
+        guard let data = try? handle.read(upToCount: expected.count) else {
             return false
         }
-        return header.hasPrefix(signature)
+        return data == expected
     }
 
     private static var bundledOpenConnectDir: String? {
@@ -343,21 +343,33 @@ enum SudoersInstaller {
             fi
 
             # 系统代理：full tunnel 下隧道已接管全部流量，系统不需要再走代理。
-            # 把各网络服务上「当前开着的」代理开关记进 session 并关掉；
-            # disconnect / cleanup 再按 session 原样恢复（只恢复我们关过的那几条）。
-            # 原则不变：只关确认开着的；分流模式走不到这里，保留用户的系统代理 / Surge。
-            networksetup -listallnetworkservices 2>/dev/null | while IFS= read -r svc; do
-                case "$svc" in ''|'An asterisk'*|'*'*) continue ;; esac
-                if networksetup -getwebproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
-                    networksetup -setwebproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_WEB=$svc"
-                fi
-                if networksetup -getsecurewebproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
-                    networksetup -setsecurewebproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_SECURE=$svc"
-                fi
-                if networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
-                    networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_SOCKS=$svc"
-                fi
-            done
+            # 先用一次 scutil --proxy（<10ms）探测哪些代理类型当前开启；未开任何代理时直接跳过
+            # 全部 networksetup 循环（省去 15~30 次子进程 fork）。若 scutil 异常无输出则保守全检。
+            PROXY_DUMP="$(scutil --proxy 2>/dev/null || true)"
+            HAS_WEB=0
+            HAS_SECURE=0
+            HAS_SOCKS=0
+            if [ -z "$PROXY_DUMP" ]; then
+                HAS_WEB=1; HAS_SECURE=1; HAS_SOCKS=1
+            else
+                printf '%s\n' "$PROXY_DUMP" | grep -Eq 'HTTPEnable[[:space:]]*:[[:space:]]*1' && HAS_WEB=1
+                printf '%s\n' "$PROXY_DUMP" | grep -Eq 'HTTPSEnable[[:space:]]*:[[:space:]]*1' && HAS_SECURE=1
+                printf '%s\n' "$PROXY_DUMP" | grep -Eq 'SOCKSEnable[[:space:]]*:[[:space:]]*1' && HAS_SOCKS=1
+            fi
+            if [ "$HAS_WEB" = "1" ] || [ "$HAS_SECURE" = "1" ] || [ "$HAS_SOCKS" = "1" ]; then
+                networksetup -listallnetworkservices 2>/dev/null | while IFS= read -r svc; do
+                    case "$svc" in ''|'An asterisk'*|'*'*) continue ;; esac
+                    if [ "$HAS_WEB" = "1" ] && networksetup -getwebproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
+                        networksetup -setwebproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_WEB=$svc"
+                    fi
+                    if [ "$HAS_SECURE" = "1" ] && networksetup -getsecurewebproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
+                        networksetup -setsecurewebproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_SECURE=$svc"
+                    fi
+                    if [ "$HAS_SOCKS" = "1" ] && networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
+                        networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_SOCKS=$svc"
+                    fi
+                done
+            fi
         fi
 
         # 5) DNS
@@ -366,9 +378,10 @@ enum SudoersInstaller {
             VPN_DNS=$(echo "$INTERNAL_IP4_DNS" | awk '{print $1}')
             DNS_PROXY="\#(dnsProxyPath)"
             if [ -x "$DNS_PROXY" ]; then
-                # 杀掉上一次残留的 dns-proxy（升级、异常退出等场景可能留下孤儿进程占住端口 53）
-                pkill -x xdvpn-dns-proxy 2>/dev/null || true
-                sleep 0.2
+                # 杀掉上一次残留的 dns-proxy（仅当确实杀到残留进程时才等 0.2s 释放端口 53）
+                if pkill -x xdvpn-dns-proxy 2>/dev/null; then
+                    sleep 0.2
+                fi
                 READY="$READY_FILE"
                 rm -f "$READY"
                 nohup "$DNS_PROXY" --vpn-dns "$VPN_DNS" --utun "$TUNDEV" \
@@ -567,8 +580,6 @@ enum SudoersInstaller {
               RESOLVER_FILE) remove_xdvpn_resolver "$val" ;;
             esac
         done < "$SESSION"
-        dscacheutil -flushcache
-        killall -HUP mDNSResponder 2>/dev/null || true
     fi
     # 兜底：杀掉任何残留的 dns-proxy（升级遗留、session 丢失等）
     pkill -x xdvpn-dns-proxy 2>/dev/null || true
@@ -578,13 +589,10 @@ enum SudoersInstaller {
         [ -f "$f" ] && remove_xdvpn_resolver "$f"
     done 2>/dev/null || true
 
-    # 全局 DNS key 是 XDVPN 独占的固定资源，必须无条件清理。session 可能在
-    # openconnect crash、强杀或并发退出时缺失，不能拿它当清理前提。
-    scutil <<EOF >/dev/null
-    remove ${GLOBAL_DNS_KEY}
-    quit
-    EOF
+    # 全局 DNS key 是 XDVPN 独占的固定资源，必须无条件清理。合并 remove + show 为单次 scutil 调用，
+    # 并在所有 resolver 文件和全局 DNS 清理完毕后一次性刷新 DNS 缓存。
     DNS_STATE="$(scutil <<EOF 2>&1
+    remove ${GLOBAL_DNS_KEY}
     show ${GLOBAL_DNS_KEY}
     quit
     EOF

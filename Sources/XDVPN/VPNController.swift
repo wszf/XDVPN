@@ -59,15 +59,18 @@ final class VPNController: ObservableObject {
     @Published var rememberPassword: Bool = true
     /// 启动时自动连接 —— 远程维护机器场景：开机/重启后无需人工操作即可上线
     @Published var autoConnectOnLaunch: Bool = false {
-        didSet { UserDefaults.standard.set(autoConnectOnLaunch, forKey: "xdvpn.autoConnectOnLaunch") }
+        didSet {
+            guard !isLoadingPrefs else { return }
+            UserDefaults.standard.set(autoConnectOnLaunch, forKey: "xdvpn.autoConnectOnLaunch")
+        }
     }
 
     // MARK: - Wi-Fi 按需连接
 
     @Published var wifiOnDemandEnabled: Bool = false {
         didSet {
-            UserDefaults.standard.set(wifiOnDemandEnabled, forKey: "xdvpn.wifiOnDemand.enabled")
             guard !isLoadingPrefs else { return }
+            UserDefaults.standard.set(wifiOnDemandEnabled, forKey: "xdvpn.wifiOnDemand.enabled")
             if wifiOnDemandEnabled {
                 suppressedAutoConnectSSID = nil
                 _ = refreshCurrentWiFiSSID()
@@ -81,7 +84,10 @@ final class VPNController: ObservableObject {
         }
     }
     @Published var wifiOnDemandRules: [WiFiOnDemandRule] = [] {
-        didSet { saveWiFiOnDemandRules() }
+        didSet {
+            guard !isLoadingPrefs else { return }
+            saveWiFiOnDemandRules()
+        }
     }
     @Published private(set) var currentWiFiSSID: String?
     @Published private(set) var wifiOnDemandStatusText: String = "未启用"
@@ -90,21 +96,21 @@ final class VPNController: ObservableObject {
 
     // MARK: - 分流（Split Tunnel）—— 仅在 runningMode == .split 时生效
     @Published var splitPreset10: Bool = true {      // 10.0.0.0/8
-        didSet { updateSplitRuleSummaryIfNeeded() }
+        didSet { guard !isLoadingPrefs else { return }; updateSplitRuleSummaryIfNeeded() }
     }
     @Published var splitPreset172: Bool = true {     // 172.16.0.0/12
-        didSet { updateSplitRuleSummaryIfNeeded() }
+        didSet { guard !isLoadingPrefs else { return }; updateSplitRuleSummaryIfNeeded() }
     }
     @Published var splitPreset192: Bool = false {    // 192.168.0.0/16（通常是本地 LAN）
-        didSet { updateSplitRuleSummaryIfNeeded() }
+        didSet { guard !isLoadingPrefs else { return }; updateSplitRuleSummaryIfNeeded() }
     }
     /// 自定义 CIDR，多行/逗号分隔
     @Published var splitCustom: String = "" {
-        didSet { updateSplitRuleSummaryIfNeeded() }
+        didSet { guard !isLoadingPrefs else { return }; updateSplitRuleSummaryIfNeeded() }
     }
     /// 域名分流后缀列表，一行一个（如 xindong.com），匹配该域名及所有子域名
     @Published var splitDomains: String = "" {
-        didSet { updateSplitRuleSummaryIfNeeded() }
+        didSet { guard !isLoadingPrefs else { return }; updateSplitRuleSummaryIfNeeded() }
     }
     /// 缓存的分流摘要，避免主窗口其他字段变化时重复解析 CIDR/域名列表。
     private(set) var splitRuleSummary: String = "2 个网段 走 VPN"
@@ -154,7 +160,13 @@ final class VPNController: ObservableObject {
     var trafficOutRate: UInt64 { trafficMonitor.snapshot.bytesOutRate }
     /// 菜单栏标题里是否外显实时速度
     @Published var showSpeedInMenuBar: Bool = false {
-        didSet { UserDefaults.standard.set(showSpeedInMenuBar, forKey: "xdvpn.showSpeedInMenuBar") }
+        didSet {
+            guard !isLoadingPrefs else { return }
+            UserDefaults.standard.set(showSpeedInMenuBar, forKey: "xdvpn.showSpeedInMenuBar")
+            if showSpeedInMenuBar, isConnected {
+                pollTick(forceTrafficSample: true)
+            }
+        }
     }
 
     // MARK: - 运行模式（三选一）
@@ -184,7 +196,10 @@ final class VPNController: ObservableObject {
     }
 
     @Published var runningMode: RunningMode = .split {
-        didSet { UserDefaults.standard.set(runningMode.rawValue, forKey: "xdvpn.runningMode") }
+        didSet {
+            guard !isLoadingPrefs else { return }
+            UserDefaults.standard.set(runningMode.rawValue, forKey: "xdvpn.runningMode")
+        }
     }
 
     /// 当前底层进程真实采用的模式。`runningMode` 是用户选择/下次连接模式；
@@ -206,12 +221,14 @@ final class VPNController: ObservableObject {
     // MARK: - SOCKS5 代理（给 Surge / Clash 这类客户端用）
     @Published var socks5Enabled: Bool = true {
         didSet {
+            guard !isLoadingPrefs else { return }
             UserDefaults.standard.set(socks5Enabled, forKey: "xdvpn.socks5.enabled")
             applySocks5State()
         }
     }
     @Published var socks5Port: Int = 5180 {
         didSet {
+            guard !isLoadingPrefs else { return }
             UserDefaults.standard.set(socks5Port, forKey: "xdvpn.socks5.port")
             applySocks5State()
         }
@@ -219,8 +236,14 @@ final class VPNController: ObservableObject {
     @Published private(set) var socks5Active: Bool = false
     @Published private(set) var socks5Error: String?
 
-    /// 主窗口当前是否可见：窗口关闭且未在状态栏外显速度时，可降低非 full 模式的流量采集频率。
-    var isMainWindowVisible: Bool = false
+    /// 主窗口当前是否可见（含遮挡/最小化检测）：不可见且未在状态栏外显速度时，降低非 full 模式的流量采集频率。
+    var isMainWindowVisible: Bool = false {
+        didSet {
+            if isMainWindowVisible, !oldValue, isConnected {
+                pollTick(forceTrafficSample: true)
+            }
+        }
+    }
 
     // MARK: - 私有
 
@@ -233,16 +256,20 @@ final class VPNController: ObservableObject {
 
     private struct PollSample: Sendable {
         let processAlive: Bool
+        let resolvedPid: pid_t?
         let session: RouteScriptSession?
         let sessionStamp: SessionFileStamp?
         let tunnelInfo: TunnelInfo?
     }
 
-    private var lastTrafficSample: (inBytes: UInt64, outBytes: UInt64, at: Date)?
+    /// 使用单调时钟（systemUptime）计算速率与黑洞超时，免疫系统 NTP 墙钟跳变。
+    private var lastTrafficSample: (inBytes: UInt64, outBytes: UInt64, uptime: TimeInterval)?
+    private var connectedAtUptime: TimeInterval?
     private var pollTimer: Timer?
     private let pollQueue = DispatchQueue(label: "com.kafeifei.xdvpn.poll", qos: .utility)
     private var pollInFlight = false
     private var pollTickCount: UInt64 = 0
+    private var cachedProcessPid: pid_t?
     private var cachedSessionStamp: SessionFileStamp?
     private var connectionTask: Task<Void, Never>?
     private var connectionAttemptID: UUID?
@@ -267,15 +294,15 @@ final class VPNController: ObservableObject {
     private var hasObservedSSID = false
     private var wifiSSIDFallbackInFlight = false
     private var wifiSSIDFallbackTask: Task<Void, Never>?
-    private var lastWiFiSSIDFallbackStartedAt: Date?
+    private var lastWiFiSSIDFallbackStartedUptime: TimeInterval?
     /// 当 Wi-Fi 规则触发时恰逢 isBusy（例如正在断开/切换），标记延后到 isBusy 结束后补评估。
     private var pendingWiFiPolicyReevaluation = false
     /// 用户在该 SSID 下手动点过「断开」：离开该 SSID 或手动连接前，不再被同一 SSID 的自动连接规则拉回。
     private var suppressedAutoConnectSSID: String?
 
-    // 黑洞检测（full 模式）：跟踪入站字节是否长期停滞
+    // 黑洞检测（full 模式）：跟踪入站字节是否长期停滞（单调时钟）
     private var lastInboundBytes: UInt64 = 0
-    private var lastInboundChangeAt: Date?
+    private var lastInboundChangeUptime: TimeInterval?
     private var hadInboundEverSinceConnect = false
 
     private var sleepObserver: NSObjectProtocol?
@@ -746,14 +773,14 @@ final class VPNController: ObservableObject {
     private func scheduleWiFiSSIDFallback(trigger: String, minInterval: TimeInterval) {
         guard !wifiSSIDFallbackInFlight else { return }
         guard wifiAssociated, !wifiSSIDLocationPermissionRequired else { return }
-        let now = Date()
-        if let last = lastWiFiSSIDFallbackStartedAt,
-           now.timeIntervalSince(last) < minInterval {
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        if let last = lastWiFiSSIDFallbackStartedUptime,
+           nowUptime - last < minInterval {
             return
         }
 
         wifiSSIDFallbackInFlight = true
-        lastWiFiSSIDFallbackStartedAt = now
+        lastWiFiSSIDFallbackStartedUptime = nowUptime
 
         let task = Task { @MainActor [weak self] in
             let ssid = await OpenConnectRunner.runBlocking {
@@ -1226,8 +1253,10 @@ final class VPNController: ObservableObject {
                     self.isAutoReconnecting = false
                     self.resetBlackholeTracking()
                     self.activeMode = mode
-                    self.isConnected = true
+                    self.cachedProcessPid = nil
+                    self.connectedAtUptime = ProcessInfo.processInfo.systemUptime
                     self.connectedAt = now
+                    self.isConnected = true
                     if proxyMode {
                         // 纯代理模式：ocproxy 已在 socksPort 暴露 SOCKS5
                         self.statusText = "已连接（纯代理 · SOCKS5 127.0.0.1:\(socksPort)）"
@@ -1375,10 +1404,18 @@ final class VPNController: ObservableObject {
                 return (err, SudoersInstaller.isInstalled)
             }
             guard let self else { return }
-            self.isBusy = false
             self.sudoConfigured = installed
-            if let errMsg { self.statusText = errMsg }
-            else if !self.isConnected { self.statusText = "未连接" }
+            if let errMsg {
+                self.statusText = errMsg
+                appLog(.error, "组件安装失败：\(errMsg)")
+            } else if !installed {
+                self.statusText = "组件校验未通过，请重新安装"
+                appLog(.error, "组件安装后校验未通过（isInstalled=false）")
+            } else if !self.isConnected {
+                self.statusText = "未连接"
+                appLog(.info, "免密组件安装完成")
+            }
+            self.isBusy = false
             // 配置成功 + 凭据齐全 → 自动连接
             if errMsg == nil, thenConnect, self.canConnect {
                 self.connect()
@@ -1421,29 +1458,48 @@ final class VPNController: ObservableObject {
         pollTimer = nil
         pollInFlight = false
         pollTickCount = 0
+        cachedProcessPid = nil
     }
 
-    private func pollTick() {
+    private func pollTick(forceTrafficSample: Bool = false) {
         guard isConnected, !pollInFlight else { return }
         pollInFlight = true
         pollTickCount &+= 1
 
         let mode = activeMode ?? runningMode
+        let previousPid = cachedProcessPid
         let previousStamp = cachedSessionStamp
         let currentIface = tunnelInterface
         // 仅在需要实时速率展示（菜单栏外显/主窗口可见）或 full 模式黑洞检测时每秒采流量；
         // 后台静默 split 模式每 5 秒采一次接口统计，但每秒仍检查进程存活。
-        let needsHighFreqTraffic = showSpeedInMenuBar || isMainWindowVisible || mode == .full
+        let needsHighFreqTraffic = forceTrafficSample || showSpeedInMenuBar || isMainWindowVisible || mode == .full
         let shouldSampleTraffic = mode != .proxy && (needsHighFreqTraffic || pollTickCount % 5 == 0)
+        let shouldCheckSession = mode != .proxy && (currentIface == nil || pollTickCount % 3 == 1)
 
         pollQueue.async { [weak self] in
-            let running = mode == .proxy ? OpenConnectRunner.isProxyModeRunning : OpenConnectRunner.isRunning
+            // PID 缓存快路径：同一连接期间 openconnect PID 稳定，直接 kill(pid, 0) 免去每秒读盘。
+            // 仅当无缓存或缓存 PID 已退出时才重新读取 pid 文件复核。
+            let resolvedPid: pid_t?
+            let running: Bool
+            if let pid = previousPid, OpenConnectRunner.isAlive(pid) {
+                resolvedPid = pid
+                running = true
+            } else {
+                let freshPid = mode == .proxy ? OpenConnectRunner.proxyModePid : OpenConnectRunner.currentPid()
+                if let freshPid, OpenConnectRunner.isAlive(freshPid) {
+                    resolvedPid = freshPid
+                    running = true
+                } else {
+                    resolvedPid = nil
+                    running = false
+                }
+            }
 
             var parsedSession: RouteScriptSession?
             var nextStamp = previousStamp
             var effectiveIface = currentIface
 
-            if running, mode != .proxy {
+            if running, shouldCheckSession {
                 let (session, stamp) = Self.readSessionFileIfChanged(previousStamp: previousStamp)
                 parsedSession = session
                 nextStamp = stamp
@@ -1461,6 +1517,7 @@ final class VPNController: ObservableObject {
 
             let sample = PollSample(
                 processAlive: running,
+                resolvedPid: resolvedPid,
                 session: parsedSession,
                 sessionStamp: nextStamp,
                 tunnelInfo: info
@@ -1475,6 +1532,7 @@ final class VPNController: ObservableObject {
         pollInFlight = false
         guard isConnected else { return }
 
+        cachedProcessPid = sample.resolvedPid
         if sample.processAlive, mode != .proxy {
             cachedSessionStamp = sample.sessionStamp
             if let session = sample.session {
@@ -1487,12 +1545,15 @@ final class VPNController: ObservableObject {
         }
         guard !isBusy else { return }
 
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        let secsSinceConnect = connectedAtUptime.map { max(0, nowUptime - $0) } ?? 9999
+
         // 健康判定（纯逻辑、已单测）：进程死 / 黑洞 → 重连；健康 → 喂稳定窗口
         let facts = TunnelFacts(
             declaredConnected: isConnected,
             processAlive: sample.processAlive,
             mode: coreMode,
-            secsSinceConnect: connectedAt.map { Date().timeIntervalSince($0) } ?? 9999,
+            secsSinceConnect: secsSinceConnect,
             graceSeconds: 15,
             defaultRouteOnUtun: nil,        // 路由主动探测留作后续，先不在主线程跑 route
             inboundStalledSeconds: inboundStalledSeconds(),
@@ -1547,19 +1608,20 @@ final class VPNController: ObservableObject {
     private func trackInbound() {
         if trafficIn != lastInboundBytes {
             lastInboundBytes = trafficIn
-            lastInboundChangeAt = Date()
+            lastInboundChangeUptime = ProcessInfo.processInfo.systemUptime
             if trafficIn > 0 { hadInboundEverSinceConnect = true }
         }
     }
 
     private func inboundStalledSeconds() -> TimeInterval {
-        let ref = lastInboundChangeAt ?? connectedAt ?? Date()
-        return Date().timeIntervalSince(ref)
+        let nowUptime = ProcessInfo.processInfo.systemUptime
+        let ref = lastInboundChangeUptime ?? connectedAtUptime ?? nowUptime
+        return max(0, nowUptime - ref)
     }
 
     private func resetBlackholeTracking() {
         lastInboundBytes = 0
-        lastInboundChangeAt = nil
+        lastInboundChangeUptime = nil
         hadInboundEverSinceConnect = false
     }
 
@@ -1836,10 +1898,10 @@ final class VPNController: ObservableObject {
 
         var next = trafficMonitor.snapshot
 
-        // 估算实时速率：当前样本 vs 上次样本
-        let now = Date()
+        // 估算实时速率：使用单调时钟，避免系统 NTP 校时导致速率跳变
+        let nowUptime = ProcessInfo.processInfo.systemUptime
         if let last = lastTrafficSample {
-            let dt = now.timeIntervalSince(last.at)
+            let dt = nowUptime - last.uptime
             if dt > 0.1 {
                 let dIn = info.bytesIn >= last.inBytes ? info.bytesIn - last.inBytes : 0
                 let dOut = info.bytesOut >= last.outBytes ? info.bytesOut - last.outBytes : 0
@@ -1849,7 +1911,7 @@ final class VPNController: ObservableObject {
                 next.bytesOutRate = newOutRate
             }
         }
-        lastTrafficSample = (info.bytesIn, info.bytesOut, now)
+        lastTrafficSample = (info.bytesIn, info.bytesOut, nowUptime)
         next.bytesIn = info.bytesIn
         next.bytesOut = info.bytesOut
         trafficMonitor.update(next)
@@ -1857,11 +1919,13 @@ final class VPNController: ObservableObject {
 
     private func clearDiagnostics() {
         connectedAt = nil
+        connectedAtUptime = nil
         tunnelInterface = nil
         tunnelIP = nil
         vpnGateway = nil
         activeRoutes = []
         dnsProxyActive = false
+        cachedProcessPid = nil
         cachedSessionStamp = nil
         trafficMonitor.reset()
         lastTrafficSample = nil

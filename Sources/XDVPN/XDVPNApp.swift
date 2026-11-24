@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import ImageIO
 import SwiftUI
 
 // MARK: - Open main window action
@@ -59,12 +60,26 @@ enum MenuBarIcon {
         cached ?? fallbackSymbol
     }
 
-    private static func makeImage() -> NSImage? {
-        guard let source = NSImage(named: "Icon"),
-              let cgSrc = source.cgImage(forProposedRect: nil, context: nil, hints: nil)
-        else { return nil }
+    private static func loadThumbnailedIcon(maxPixelSize: Int) -> CGImage? {
+        // 用 CGImageSource 直接按小尺寸解码缩略图，避免 NSImage(named: "Icon") 将 1000×1000 原图常驻全局缓存。
+        if let url = Bundle.main.url(forResource: "Icon", withExtension: "png"),
+           let source = CGImageSourceCreateWithURL(url as CFURL, nil) {
+            let options: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+            ]
+            if let thumb = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) {
+                return thumb
+            }
+        }
+        return NSImage(named: "Icon")?.cgImage(forProposedRect: nil, context: nil, hints: nil)
+    }
 
-        let workSize = 256        // 处理用大尺寸，保证降采样质量
+    private static func makeImage() -> NSImage? {
+        let workSize = 128        // 足够覆盖 13pt @3x (39px) 的高质量降采样，内存开销减少 75%
+        guard let cgSrc = loadThumbnailedIcon(maxPixelSize: workSize) else { return nil }
+
         let bytesPerRow = workSize * 4
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
@@ -106,19 +121,28 @@ enum MenuBarIcon {
                               width: maxX - minX + 1, height: maxY - minY + 1)
         guard let cropped = fullCG.cropping(to: cropRect) else { return nil }
 
-        // 输出：紧凑尺寸，内容 13pt 高度，宽度贴合内容不加 padding。
-        // 速度文字的间距由 composeStatusImage() 的 iconGap 负责。
+        // 一次性预光栅化为 3x 位图（仅 ~39×39px），避免每次菜单栏重绘都重复缩放 CGImage。
         let contentPt: CGFloat = 13
         let aspect = CGFloat(cropped.width) / CGFloat(cropped.height)
         let contentWPt = ceil(contentPt * aspect)
+        let scale = 3
+        let pxW = Int(contentWPt) * scale
+        let pxH = Int(contentPt) * scale
 
-        let img = NSImage(size: NSSize(width: contentWPt, height: contentPt),
-                          flipped: false) { _ in
-            guard let ctx = NSGraphicsContext.current?.cgContext else { return false }
-            ctx.interpolationQuality = .high
-            ctx.draw(cropped, in: CGRect(x: 0, y: 0, width: contentWPt, height: contentPt))
-            return true
-        }
+        guard let outCtx = CGContext(
+            data: nil,
+            width: pxW,
+            height: pxH,
+            bitsPerComponent: 8,
+            bytesPerRow: pxW * 4,
+            space: colorSpace,
+            bitmapInfo: bitmapInfo
+        ) else { return nil }
+        outCtx.interpolationQuality = .high
+        outCtx.draw(cropped, in: CGRect(x: 0, y: 0, width: pxW, height: pxH))
+        guard let rasterized = outCtx.makeImage() else { return nil }
+
+        let img = NSImage(cgImage: rasterized, size: NSSize(width: contentWPt, height: contentPt))
         return img
     }
 }
@@ -268,8 +292,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .sink { [weak self] _ in self?.refreshStatusItem() }
             .store(in: &cancellables)
 
-        // 流量在独立 monitor 中一次性发布。先按外显开关过滤，未显示速度时跳过
-        // formatRate 格式化；按最终显示文本去重，避免同一秒重复合成图片。
+        // 流量在独立 monitor 中一次性发布（已在 @MainActor）。先按外显开关过滤，
+        // 未显示速度时跳过 formatRate 格式化；按最终显示文本去重，避免重复合成图片。
         controller.trafficMonitor.$snapshot
             .filter { [weak self] _ in
                 guard let self else { return false }
@@ -284,7 +308,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 )
             }
             .removeDuplicates()
-            .receive(on: RunLoop.main)
             .sink { [weak self] _ in
                 guard let self else { return }
                 if self.controller.isConnected, self.controller.showSpeedInMenuBar {
@@ -299,6 +322,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // template image：颜色用 .black，最终由系统按菜单栏明暗自动反色
         .foregroundColor: NSColor.black,
     ]
+    /// 速率文本为固定 8 字符等宽（如 "999 KB/s"），预测量一次避免每秒走 CoreText size(withAttributes:)。
+    private static let statusRateFixedWidth: CGFloat = ceil(
+        ("999 MB/s" as NSString).size(withAttributes: statusRateTextAttrs).width
+    )
 
     private func refreshStatusItem() {
         guard let button = statusItem.button else { return }
@@ -335,9 +362,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let upStr = rates.up
 
         let textAttrs = Self.statusRateTextAttrs
-        let downSize = (downStr as NSString).size(withAttributes: textAttrs)
-        let upSize = (upStr as NSString).size(withAttributes: textAttrs)
-        let textW = max(downSize.width, upSize.width)
+        let textW = Self.statusRateFixedWidth
 
         let iconW = icon.size.width
         let iconH = icon.size.height
@@ -447,6 +472,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 // MARK: - NSWindowDelegate
 
 extension AppDelegate: NSWindowDelegate {
+    func windowDidChangeOcclusionState(_ notification: Notification) {
+        guard let window = notification.object as? NSWindow, window === mainWindow else { return }
+        controller.isMainWindowVisible = window.occlusionState.contains(.visible)
+    }
+
     func windowWillClose(_ notification: Notification) {
         guard let window = notification.object as? NSWindow, window === mainWindow else { return }
         // 断开 NSWindow -> NSHostingController -> SwiftUI 的完整观察链，同时触发

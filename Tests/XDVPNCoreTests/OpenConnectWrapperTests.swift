@@ -101,7 +101,7 @@ final class OpenConnectWrapperTests: XCTestCase {
 
     func test_helperVersionWasBumpedWithTheWrapperChange() throws {
         let installer = try source("Sources/XDVPN/SudoersInstaller.swift")
-        XCTAssertTrue(installer.contains("static let helperVersion = 15"))
+        XCTAssertTrue(installer.contains("static let helperVersion = 16"))
     }
 
     // MARK: - Harness

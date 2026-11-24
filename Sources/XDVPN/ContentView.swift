@@ -107,13 +107,14 @@ struct MainWindowView: View {
     }
 }
 
-/// 让窗口背景使用 macOS 默认的窗口色（避免出现纯白卡卡的感觉）
+/// 让窗口背景使用 macOS 默认的窗口色（避免出现纯白卡卡的感觉）。
+/// 使用 .followsWindowActiveState：窗口失焦/后台时自动停止实时 behind-window 模糊合成，降低 WindowServer GPU/CPU 耗电。
 private struct WindowBackground: NSViewRepresentable {
     func makeNSView(context: Context) -> NSVisualEffectView {
         let v = NSVisualEffectView()
         v.material = .windowBackground
         v.blendingMode = .behindWindow
-        v.state = .active
+        v.state = .followsWindowActiveState
         return v
     }
     func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
@@ -229,6 +230,8 @@ private struct ConnectionDurationText: NSViewRepresentable {
     @MainActor
     final class Coordinator: NSObject {
         private weak var label: NSTextField?
+        private weak var observedWindow: NSWindow?
+        private var occlusionObserver: NSObjectProtocol?
         private var connectedAt: Date?
         private var timer: Timer?
 
@@ -236,7 +239,70 @@ private struct ConnectionDurationText: NSViewRepresentable {
             self.label = label
             self.connectedAt = connectedAt
             refresh()
+            attachOcclusionObserverIfNeeded(for: label)
+            updateTimerForOcclusion()
+        }
 
+        func update(label: NSTextField, connectedAt: Date) {
+            self.label = label
+            attachOcclusionObserverIfNeeded(for: label)
+            guard self.connectedAt != connectedAt else { return }
+            self.connectedAt = connectedAt
+            refresh()
+        }
+
+        func stop() {
+            stopTimer()
+            if let obs = occlusionObserver {
+                NotificationCenter.default.removeObserver(obs)
+                occlusionObserver = nil
+            }
+            observedWindow = nil
+        }
+
+        private func attachOcclusionObserverIfNeeded(for label: NSTextField) {
+            guard let window = label.window else {
+                // makeNSView 时 view 尚未挂入 window，下一帧再挂载遮挡监听。
+                DispatchQueue.main.async { [weak self, weak label] in
+                    guard let self, let label, let win = label.window else { return }
+                    self.attachOcclusionObserver(to: win)
+                }
+                return
+            }
+            attachOcclusionObserver(to: window)
+        }
+
+        private func attachOcclusionObserver(to window: NSWindow) {
+            guard observedWindow !== window else { return }
+            if let obs = occlusionObserver {
+                NotificationCenter.default.removeObserver(obs)
+                occlusionObserver = nil
+            }
+            observedWindow = window
+            occlusionObserver = NotificationCenter.default.addObserver(
+                forName: NSWindow.didChangeOcclusionStateNotification,
+                object: window,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.updateTimerForOcclusion()
+                }
+            }
+            updateTimerForOcclusion()
+        }
+
+        private func updateTimerForOcclusion() {
+            let isVisible = observedWindow?.occlusionState.contains(.visible) ?? true
+            if isVisible {
+                refresh()
+                startTimerIfNeeded()
+            } else {
+                stopTimer()
+            }
+        }
+
+        private func startTimerIfNeeded() {
+            guard timer == nil else { return }
             let timer = Timer(
                 timeInterval: 1,
                 target: self,
@@ -249,14 +315,7 @@ private struct ConnectionDurationText: NSViewRepresentable {
             self.timer = timer
         }
 
-        func update(label: NSTextField, connectedAt: Date) {
-            self.label = label
-            guard self.connectedAt != connectedAt else { return }
-            self.connectedAt = connectedAt
-            refresh()
-        }
-
-        func stop() {
+        private func stopTimer() {
             timer?.invalidate()
             timer = nil
         }
@@ -1342,7 +1401,7 @@ struct LogPanelView: View {
             }
         }
         .frame(width: 520, height: 420)
-        .background(WindowBackgroundColor())
+        .background(WindowBackground())
     }
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -1395,16 +1454,4 @@ private struct LogRow: View {
         case .error: return .red
         }
     }
-}
-
-/// sheet 背景使用窗口色，避免纯白
-private struct WindowBackgroundColor: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSVisualEffectView {
-        let v = NSVisualEffectView()
-        v.material = .windowBackground
-        v.blendingMode = .behindWindow
-        v.state = .active
-        return v
-    }
-    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {}
 }

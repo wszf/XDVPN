@@ -87,11 +87,25 @@ final class UIRefreshContractTests: XCTestCase {
     func test_processStdinWriteIsProtectedAgainstSigpipeAndProxySeparatesServerArg() throws {
         let main = try source("Sources/XDVPN/main.swift")
         let runner = try source("Sources/XDVPN/OpenConnectRunner.swift")
+        let installer = try source("Sources/XDVPN/SudoersInstaller.swift")
 
         XCTAssertTrue(main.contains("signal(SIGPIPE, SIG_IGN)"))
         XCTAssertTrue(runner.contains("try? stdin.fileHandleForWriting.write(contentsOf:"))
         XCTAssertFalse(runner.contains("stdin.fileHandleForWriting.write(Data("))
         XCTAssertTrue(runner.contains("\"--\",\n            server,"))
+        XCTAssertTrue(installer.contains("let expected = Data(signature.utf8)"))
+        XCTAssertTrue(installer.contains("handle.read(upToCount: expected.count)"))
+    }
+
+    func test_uiBackgroundAndOcclusionAvoidIdleGpuAndTimerWork() throws {
+        let content = try source("Sources/XDVPN/ContentView.swift")
+        let app = try source("Sources/XDVPN/XDVPNApp.swift")
+
+        XCTAssertTrue(content.contains("v.state = .followsWindowActiveState"))
+        XCTAssertFalse(content.contains("v.state = .active"))
+        XCTAssertTrue(content.contains("didChangeOcclusionStateNotification"))
+        XCTAssertTrue(app.contains("func windowDidChangeOcclusionState("))
+        XCTAssertTrue(app.contains("CGImageSourceCreateThumbnailAtIndex"))
     }
 
     func test_pollingRunsOnlyWhileConnectedAndUpdaterInvalidatesSession() throws {
