@@ -286,6 +286,7 @@ final class VPNController: ObservableObject {
     private let pathMonitor = NetworkPathMonitor()
     private var networkSatisfied = true
     private var networkUsesWiFi = true
+    private var networkUsesWiredEthernet = false
     private var hasPathSnapshot = false
     private var changeDetector = NetworkChangeDetector()
     private let wifiSSIDReader = WiFiSSIDReader()
@@ -295,6 +296,10 @@ final class VPNController: ObservableObject {
     private var wifiSSIDFallbackInFlight = false
     private var wifiSSIDFallbackTask: Task<Void, Never>?
     private var lastWiFiSSIDFallbackStartedUptime: TimeInterval?
+    /// 单调递增观测版本号：确保异步 system_profiler 的过期结果绝不覆盖更新的 CoreWLAN 观测值。
+    private var wifiObservationGeneration: UInt64 = 0
+    /// 唤醒后或 Wi-Fi 规则触发的等待网络就绪任务，防止重复并发拉起。
+    private var wifiWakeEvaluationTask: Task<Void, Never>?
     /// 当 Wi-Fi 规则触发时恰逢 isBusy（例如正在断开/切换），标记延后到 isBusy 结束后补评估。
     private var pendingWiFiPolicyReevaluation = false
     /// 用户在该 SSID 下手动点过「断开」：离开该 SSID 或手动连接前，不再被同一 SSID 的自动连接规则拉回。
@@ -380,6 +385,7 @@ final class VPNController: ObservableObject {
         pollTimer?.invalidate()
         autoReconnectTimer?.invalidate()
         wifiSSIDFallbackTask?.cancel()
+        wifiWakeEvaluationTask?.cancel()
         pathMonitor.cancel()
         let nc = NSWorkspace.shared.notificationCenter
         if let obs = sleepObserver { nc.removeObserver(obs) }
@@ -393,20 +399,25 @@ final class VPNController: ObservableObject {
             // 回调在后台 queue，切回 MainActor 再读写状态
             Task { @MainActor [weak self] in
                 guard let self else { return }
-                let previousUsesWiFi = self.networkUsesWiFi
+                let previousSatisfied = self.networkSatisfied
+                let previousUsesWired = self.networkUsesWiredEthernet
                 let hadSnapshot = self.hasPathSnapshot
                 self.hasPathSnapshot = true
                 self.networkSatisfied = snapshot.isSatisfied
                 self.networkUsesWiFi = snapshot.usesWiFi
+                self.networkUsesWiredEthernet = snapshot.usesWiredEthernet
 
                 let changed = self.changeDetector.observe(
                     fingerprint: physicalInterfaceFingerprint(snapshot.interfaceNames))
-                let wifiTransportChanged = hadSnapshot && (previousUsesWiFi != snapshot.usesWiFi)
+                let wiredTransportChanged = hadSnapshot && (previousUsesWired != snapshot.usesWiredEthernet)
+                let becameSatisfied = hadSnapshot && !previousSatisfied && snapshot.isSatisfied
                 let ssidChanged = self.refreshCurrentWiFiSSID(
-                    fallbackMinInterval: (changed || wifiTransportChanged) ? 8 : 30
+                    fallbackMinInterval: (changed || wiredTransportChanged || becameSatisfied) ? 8 : 30
                 )
-                if changed || ssidChanged || wifiTransportChanged {
+                if changed || ssidChanged || wiredTransportChanged {
                     self.handleNetworkChanged()
+                } else if becameSatisfied, self.wifiOnDemandEnabled {
+                    _ = self.applyWiFiOnDemandPolicy(trigger: "网络就绪")
                 }
             }
         }
@@ -713,17 +724,14 @@ final class VPNController: ObservableObject {
     }
 
     private var currentWiFiAssociationState: WiFiAssociationState {
-        // 明确未关联 Wi-Fi，或当前活跃默认出口为有线/USB 等非 Wi-Fi 时，不再按 Wi-Fi 规则干预。
-        if !wifiAssociated {
-            return .notOnWiFi
-        }
-        if hasPathSnapshot && networkSatisfied && !networkUsesWiFi {
-            return .notOnWiFi
-        }
-        if let ssid = currentWiFiSSID {
-            return .associated(ssid: ssid)
-        }
-        return .associatedUnknownSSID
+        WiFiAssociationState.resolve(
+            wifiAssociated: wifiAssociated,
+            currentSSID: currentWiFiSSID,
+            hasPathSnapshot: hasPathSnapshot,
+            networkSatisfied: networkSatisfied,
+            usesWiFi: networkUsesWiFi,
+            usesWiredEthernet: networkUsesWiredEthernet
+        )
     }
 
     @discardableResult
@@ -733,16 +741,19 @@ final class VPNController: ObservableObject {
         wifiAssociated = snapshot.isAssociatedToWiFi
 
         if let ssid = snapshot.ssid {
+            invalidatePendingWiFiFallback()
             return setObservedWiFiSSID(ssid)
         }
 
         // 未关联 Wi-Fi（关闭 Wi-Fi / 仅插网线）：明确清空，不拉起昂贵的 system_profiler。
         guard snapshot.isAssociatedToWiFi else {
+            invalidatePendingWiFiFallback()
             return setObservedWiFiSSID(nil)
         }
 
         // macOS 14+ 缺少定位权限时，system_profiler 同样只会返回 <redacted>，直接跳过。
         if wifiSSIDLocationPermissionRequired {
+            invalidatePendingWiFiFallback()
             return setObservedWiFiSSID(nil)
         }
 
@@ -750,6 +761,13 @@ final class VPNController: ObservableObject {
         // 不要立刻把已缓存的 SSID 抹成 nil（避免短暂抖动触发误拆隧道），改由异步 fallback 核实后再更新。
         scheduleWiFiSSIDFallback(trigger: "读取 Wi-Fi", minInterval: fallbackMinInterval)
         return false
+    }
+
+    private func invalidatePendingWiFiFallback() {
+        wifiObservationGeneration &+= 1
+        wifiSSIDFallbackTask?.cancel()
+        wifiSSIDFallbackTask = nil
+        wifiSSIDFallbackInFlight = false
     }
 
     @discardableResult
@@ -781,6 +799,7 @@ final class VPNController: ObservableObject {
 
         wifiSSIDFallbackInFlight = true
         lastWiFiSSIDFallbackStartedUptime = nowUptime
+        let expectedGeneration = wifiObservationGeneration
 
         let task = Task { @MainActor [weak self] in
             let ssid = await OpenConnectRunner.runBlocking {
@@ -789,6 +808,8 @@ final class VPNController: ObservableObject {
             guard let self, !Task.isCancelled else { return }
             self.wifiSSIDFallbackInFlight = false
             self.wifiSSIDFallbackTask = nil
+            // 如果在 system_profiler 运行期间 CoreWLAN 已经拿到更新的观测结果，丢弃过期结果。
+            guard self.wifiObservationGeneration == expectedGeneration else { return }
 
             let changed = self.setObservedWiFiSSID(ssid)
 
@@ -902,7 +923,8 @@ final class VPNController: ObservableObject {
             if respectManualSuppression, suppressedAutoConnectSSID == ssid {
                 return false
             }
-            guard !isConnected else { return false }
+            // 已连接或正在连接中：返回 false，允许 handleNetworkChanged() 正常取消/重建旧网络上的隧道。
+            guard !isConnected, !isConnecting else { return false }
             guard !isBusy else {
                 pendingWiFiPolicyReevaluation = true
                 return true
@@ -918,8 +940,7 @@ final class VPNController: ObservableObject {
                 return true
             }
 
-            appLog(.info, "\(trigger)：SSID \(ssid) 命中连接规则")
-            connect(silent: true)
+            connectDueToWiFiPolicy(ssid: ssid, trigger: trigger)
             return true
 
         case .noMatch:
@@ -953,6 +974,28 @@ final class VPNController: ObservableObject {
                 wifiOnDemandStatusText = missingWiFiSSIDStatusText()
             }
             return false
+        }
+    }
+
+    /// 命中 Wi-Fi「连接 VPN」规则：走带网络就绪门控与退避重试的自动连接链路，
+    /// 避免 Wi-Fi 刚关联但 DHCP/DNS 尚未就绪时首连失败一次就彻底放弃。
+    private func connectDueToWiFiPolicy(ssid: String, trigger: String) {
+        if isAutoReconnecting {
+            // 已经在自动重连队列/等网中，无需重复触发。
+            return
+        }
+        appLog(.info, "\(trigger)：SSID \(ssid) 命中连接规则")
+        policy.reset()
+        isAutoReconnecting = true
+        if !networkSatisfied {
+            statusText = "当前 Wi-Fi「\(ssid)」规则：等待网络就绪…"
+            Task { @MainActor [weak self] in
+                await self?.fireAutoReconnect()
+            }
+        } else if canConnect {
+            connect(silent: true)
+        } else {
+            isAutoReconnecting = false
         }
     }
 
@@ -1732,6 +1775,8 @@ final class VPNController: ObservableObject {
         // 睡眠场景由 shouldReconnectAfterWake 走另一条 reconnect 路径，
         // 取消掉这里 pollTick 触发的自动重连，避免两套机制打架
         cancelAutoReconnect()
+        wifiWakeEvaluationTask?.cancel()
+        wifiWakeEvaluationTask = nil
         // 休眠前先终止在途连接任务，防止随后异步回调污染状态或重新排重连。
         if isConnecting || connectionTask != nil {
             connectionAttemptID = nil
@@ -1789,16 +1834,25 @@ final class VPNController: ObservableObject {
                     self.activeMode = nil
                     self.isBusy = false
                     self.statusText = "未连接"
-                    if shouldReconnect { self.reconnectAfterWake() }
+                    if shouldReconnect {
+                        self.reconnectAfterWake()
+                    } else if self.wifiOnDemandEnabled {
+                        self.evaluateWiFiPolicyAfterWake()
+                    }
                 }
             } else if shouldReconnect {
                 reconnectAfterWake()
+            } else if wifiOnDemandEnabled {
+                evaluateWiFiPolicyAfterWake()
             }
             return
         }
 
         // 标准模式：走 sudo cleanup
-        guard sudoConfigured else { return }
+        guard sudoConfigured else {
+            if wifiOnDemandEnabled { evaluateWiFiPolicyAfterWake() }
+            return
+        }
         if isConnected || OpenConnectRunner.isRunning {
             isBusy = true
             statusText = "休眠唤醒，正在清理…"
@@ -1808,10 +1862,31 @@ final class VPNController: ObservableObject {
                 self.activeMode = nil
                 self.isBusy = false
                 self.statusText = "未连接"
-                if shouldReconnect { self.reconnectAfterWake() }
+                if shouldReconnect {
+                    self.reconnectAfterWake()
+                } else if self.wifiOnDemandEnabled {
+                    self.evaluateWiFiPolicyAfterWake()
+                }
             }
         } else if shouldReconnect {
             reconnectAfterWake()
+        } else if wifiOnDemandEnabled {
+            evaluateWiFiPolicyAfterWake()
+        }
+    }
+
+    /// 休眠前未连接 VPN，但开启了 Wi-Fi 按需连接：
+    /// 唤醒后等网络就绪再读取新 Wi-Fi 并执行规则（例如公司断开合盖 → 回家开盖自动连）。
+    private func evaluateWiFiPolicyAfterWake() {
+        wifiWakeEvaluationTask?.cancel()
+        wifiWakeEvaluationTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.awaitNetworkReady(timeout: 8)
+            guard !Task.isCancelled, self.wifiOnDemandEnabled else { return }
+            _ = self.refreshCurrentWiFiSSID(fallbackMinInterval: 4)
+            await self.awaitPendingWiFiFallback(timeout: 2.0)
+            guard !Task.isCancelled, self.wifiOnDemandEnabled else { return }
+            _ = self.applyWiFiOnDemandPolicy(trigger: "休眠唤醒")
         }
     }
 

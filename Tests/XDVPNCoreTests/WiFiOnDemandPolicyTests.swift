@@ -150,4 +150,52 @@ final class WiFiOnDemandPolicyTests: XCTestCase {
         XCTAssertFalse(outcome.shouldPause)
         XCTAssertFalse(outcome.blocksAutomaticConnect)
     }
+
+    func test_resolvePreservesWiFiWhenVirtualTunnelOwnsDefaultRoute() {
+        // VPN 全局模式 / Surge / Clash 增强模式接管默认路由时，NWPath.usesWiFi 为 false，
+        // 但 usesWiredEthernet 也为 false，此时仍必须识别为当前 Wi-Fi。
+        let state = WiFiAssociationState.resolve(
+            wifiAssociated: true,
+            currentSSID: "Office",
+            hasPathSnapshot: true,
+            networkSatisfied: true,
+            usesWiFi: false,
+            usesWiredEthernet: false
+        )
+        XCTAssertEqual(state, .associated(ssid: "Office"))
+    }
+
+    func test_resolveTreatsWiredEthernetPrimaryRouteAsNotOnWiFi() {
+        let state = WiFiAssociationState.resolve(
+            wifiAssociated: true,
+            currentSSID: "Office",
+            hasPathSnapshot: true,
+            networkSatisfied: true,
+            usesWiFi: false,
+            usesWiredEthernet: true
+        )
+        XCTAssertEqual(state, .notOnWiFi)
+    }
+
+    func test_resolveDistinguishesUnassociatedWiFiFromRedactedSSID() {
+        let unassociated = WiFiAssociationState.resolve(
+            wifiAssociated: false,
+            currentSSID: nil,
+            hasPathSnapshot: true,
+            networkSatisfied: true,
+            usesWiFi: false,
+            usesWiredEthernet: false
+        )
+        XCTAssertEqual(unassociated, .notOnWiFi)
+
+        let redacted = WiFiAssociationState.resolve(
+            wifiAssociated: true,
+            currentSSID: "<redacted>",
+            hasPathSnapshot: true,
+            networkSatisfied: true,
+            usesWiFi: true,
+            usesWiredEthernet: false
+        )
+        XCTAssertEqual(redacted, .associatedUnknownSSID)
+    }
 }

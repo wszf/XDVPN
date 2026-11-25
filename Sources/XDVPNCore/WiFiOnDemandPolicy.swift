@@ -47,12 +47,37 @@ public enum WiFiOnDemandDecision: Equatable, Sendable {
 
 /// 当前 Wi-Fi 关联观测状态，严格区分「未在 Wi-Fi 上」与「连着 Wi-Fi 但拿不到 SSID」。
 public enum WiFiAssociationState: Equatable, Sendable {
-    /// 未连 Wi-Fi（Wi-Fi 关闭/未关联）或当前主出口为非 Wi-Fi（如网线/USB 热点）。
+    /// 未连 Wi-Fi（Wi-Fi 关闭/未关联）或当前主出口明确为有线以太网。
     case notOnWiFi
     /// 已关联 Wi-Fi 且读到了真实 SSID。
     case associated(ssid: String)
     /// 已关联 Wi-Fi，但因为缺少定位权限或系统暂未返回而拿不到 SSID。
     case associatedUnknownSSID
+
+    /// 综合 CoreWLAN 关联态与 NWPath 出口类型得出当前 Wi-Fi 观测态。
+    ///
+    /// 关键点：当 VPN 全局模式或 Surge/Clash 增强模式（utun 虚拟接口）接管默认路由时，
+    /// `NWPath.usesInterfaceType(.wifi)` 会变成 `false`，而 `usesWiredEthernet` 同样为 `false`。
+    /// 只有明确走有线网口（`usesWiredEthernet && !usesWiFi`）或 Wi-Fi 本身未关联时，才判定 `.notOnWiFi`。
+    public static func resolve(
+        wifiAssociated: Bool,
+        currentSSID: String?,
+        hasPathSnapshot: Bool,
+        networkSatisfied: Bool,
+        usesWiFi: Bool,
+        usesWiredEthernet: Bool
+    ) -> WiFiAssociationState {
+        guard wifiAssociated else {
+            return .notOnWiFi
+        }
+        if hasPathSnapshot, networkSatisfied, usesWiredEthernet, !usesWiFi {
+            return .notOnWiFi
+        }
+        if let ssid = ObservedWiFiSSID.normalized(currentSSID) {
+            return .associated(ssid: ssid)
+        }
+        return .associatedUnknownSSID
+    }
 }
 
 /// 结合历史暂停态得出的完整策略结果。
